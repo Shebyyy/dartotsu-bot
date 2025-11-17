@@ -1,0 +1,25 @@
+{
+  "name": "dartotsu-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for triggering Dartotsu builds via GitHub Actions",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js",
+    "test": "node bot.js"
+  },
+  "keywords": ["discord", "bot", "github-actions", "dartotsu"],
+  "author": "Sheby",
+  "license": "MIT",
+  "dependencies": {
+    "@octokit/rest": "^20.0.2",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
