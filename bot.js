@@ -36,7 +36,8 @@ const client = new Client({
 
 // Initialize GitHub API client
 const octokit = new Octokit({ 
-  auth: process.env.GITHUB_TOKEN 
+  auth: process.env.GITHUB_TOKEN,
+  request: { fetch: require('node-fetch') } // Add this line
 });
 
 // ================================
