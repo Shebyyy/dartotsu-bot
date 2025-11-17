@@ -2,6 +2,26 @@
 // Triggers GitHub Actions workflow for building Dartotsu
 // Repository: https://github.com/Shebyyy/Dartotsu
 
+// Polyfill ReadableStream for older Node.js versions
+if (typeof ReadableStream === 'undefined') {
+  try {
+    // Try to use Node.js built-in stream/web (Node.js >= 16.5.0)
+    ReadableStream = require('stream/web').ReadableStream;
+  } catch (e) {
+    // Fallback to a minimal polyfill
+    const { Readable } = require('stream');
+    ReadableStream = class extends Readable {
+      constructor(options = {}) {
+        super(options);
+        this._controller = {
+          enqueue: (chunk) => this.push(chunk),
+          close: () => this.push(null),
+          error: (e) => this.destroy(e)
+        };
+      }
+    };
+  }
+}
 require('dotenv').config();
 const { Client, GatewayIntentBits, REST, Routes, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const { Octokit } = require('@octokit/rest');
