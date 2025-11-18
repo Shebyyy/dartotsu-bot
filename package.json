@@ -1,6 +1,6 @@
 {
   "name": "dartotsu-discord-bot",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Enhanced Discord bot for triggering Dartotsu builds via GitHub Actions",
   "main": "bot.js",
   "scripts": {
@@ -24,7 +24,8 @@
     "discord.js": "^14.14.1",
     "dotenv": "^16.3.1",
     "web-streams-polyfill": "^3.2.1",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "pg": "^8.11.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
