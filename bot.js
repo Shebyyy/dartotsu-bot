@@ -21,21 +21,27 @@ if (typeof ReadableStream === 'undefined') {
 }
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, REST, Routes, EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { Octokit } = require('@octokit/rest');
-const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN, request: { fetch: require('node-fetch') } });
 
 // ================================
-// CONFIGURATION SYSTEM
+// DATABASE CONFIGURATION SYSTEM
 // ================================
-const CONFIG_FILE = path.join(__dirname, 'bot-config.json');
+const DB_FILE = path.join(__dirname, 'bot.db');
 
-// Empty configuration (no defaults)
+// Initialize database
+const db = new sqlite3.Database(DB_FILE);
+
+// Configuration stored in database
 let botConfig = {
+  githubToken: process.env.GITHUB_TOKEN || null,
+  discordToken: process.env.DISCORD_TOKEN || null,
+  guildId: process.env.GUILD_ID || null,
   repo: { owner: null, name: null, workflowFile: null, branch: null },
   discord: {
     allowedRoleIds: [],
@@ -49,11 +55,110 @@ let botConfig = {
   }
 };
 
-// Configuration management functions
-const saveConfig = async () => {
+// Database functions
+const initDatabase = () => {
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      // Create config table
+      db.run(`CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      )`, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  });
+};
+
+const loadConfigFromDB = async () => {
+  return new Promise((resolve, reject) => {
+    db.all("SELECT key, value FROM config", (err, rows) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      
+      // Load configuration from database
+      rows.forEach(row => {
+        switch(row.key) {
+          case 'githubToken':
+            botConfig.githubToken = row.value;
+            break;
+          case 'discordToken':
+            botConfig.discordToken = row.value;
+            break;
+          case 'guildId':
+            botConfig.guildId = row.value;
+            break;
+          case 'repoOwner':
+            botConfig.repo.owner = row.value;
+            break;
+          case 'repoName':
+            botConfig.repo.name = row.value;
+            break;
+          case 'workflowFile':
+            botConfig.repo.workflowFile = row.value;
+            break;
+          case 'branch':
+            botConfig.repo.branch = row.value;
+            break;
+          case 'allowedRoles':
+            botConfig.discord.allowedRoleIds = row.value ? JSON.parse(row.value) : [];
+            break;
+          case 'logChannelId':
+            botConfig.discord.logChannelId = row.value;
+            break;
+          case 'requirePermissions':
+            botConfig.features.requirePermissions = row.value === 'true';
+            break;
+          case 'enableLogging':
+            botConfig.features.enableLogging = row.value === 'true';
+            break;
+          case 'autoRefreshStatus':
+            botConfig.features.autoRefreshStatus = row.value === 'true';
+            break;
+          case 'refreshInterval':
+            botConfig.features.refreshInterval = parseInt(row.value) || 30000;
+            break;
+        }
+      });
+      
+      resolve();
+    });
+  });
+};
+
+const saveConfigToDB = async (key, value) => {
+  return new Promise((resolve, reject) => {
+    db.run(
+      "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+      [key, value],
+      function(err) {
+        if (err) reject(err);
+        else resolve();
+      }
+    );
+  });
+};
+
+const saveAllConfigToDB = async () => {
   try {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(botConfig, null, 2));
-    log('Configuration saved', 'INFO');
+    await saveConfigToDB('githubToken', botConfig.githubToken || '');
+    await saveConfigToDB('discordToken', botConfig.discordToken || '');
+    await saveConfigToDB('guildId', botConfig.guildId || '');
+    await saveConfigToDB('repoOwner', botConfig.repo.owner || '');
+    await saveConfigToDB('repoName', botConfig.repo.name || '');
+    await saveConfigToDB('workflowFile', botConfig.repo.workflowFile || '');
+    await saveConfigToDB('branch', botConfig.repo.branch || '');
+    await saveConfigToDB('allowedRoles', JSON.stringify(botConfig.discord.allowedRoleIds));
+    await saveConfigToDB('logChannelId', botConfig.discord.logChannelId || '');
+    await saveConfigToDB('requirePermissions', botConfig.features.requirePermissions.toString());
+    await saveConfigToDB('enableLogging', botConfig.features.enableLogging.toString());
+    await saveConfigToDB('autoRefreshStatus', botConfig.features.autoRefreshStatus.toString());
+    await saveConfigToDB('refreshInterval', botConfig.features.refreshInterval.toString());
+    
+    log('Configuration saved to database', 'INFO');
     return true;
   } catch (error) {
     log(`Failed to save configuration: ${error.message}`, 'ERROR');
@@ -61,16 +166,13 @@ const saveConfig = async () => {
   }
 };
 
-const loadConfig = async () => {
-  try {
-    if (fs.existsSync(CONFIG_FILE)) {
-      const data = fs.readFileSync(CONFIG_FILE, 'utf8');
-      botConfig = JSON.parse(data);
-      log('Configuration loaded from file', 'INFO');
-    }
-  } catch (error) {
-    log(`Failed to load configuration: ${error.message}`, 'ERROR');
-  }
+const resetConfigInDB = async () => {
+  return new Promise((resolve, reject) => {
+    db.run("DELETE FROM config", (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
 };
 
 const getConfig = () => botConfig;
@@ -119,25 +221,14 @@ const commands = [
   { name: 'help', description: 'Command help' },
   {
     name: 'config',
-    description: 'Manage bot configuration (Admin only)',
+    description: 'Manage bot configuration',
+    default_member_permissions: PermissionFlagsBits.Administrator.toString(),
     options: [
       { name: 'action', description: 'Configuration action', type: 3, required: true, choices: [
-        { name: '👁️ View', value: 'view' },
-        { name: '⚙️ Set', value: 'set' },
-        { name: '🔄 Reset', value: 'reset' }
-      ]},
-      { name: 'key', description: 'Configuration key', type: 3, required: false, choices: [
-        { name: '📦 GitHub Repository', value: 'repo' },
-        { name: '🔧 Workflow File', value: 'workflow' },
-        { name: '🌿 Branch', value: 'branch' },
-        { name: '👥 Allowed Role IDs', value: 'allowedRoles' },
-        { name: '📢 Log Channel ID', value: 'logChannel' },
-        { name: '🔐 Require Permissions', value: 'requirePermissions' },
-        { name: '📝 Enable Logging', value: 'enableLogging' },
-        { name: '🔄 Auto Refresh Status', value: 'autoRefresh' },
-        { name: '⏱️ Refresh Interval', value: 'refreshInterval' }
-      ]},
-      { name: 'value', description: 'New value', type: 3, required: false }
+        { name: '👁️ View Current', value: 'view' },
+        { name: '⚙️ Configure', value: 'configure' },
+        { name: '🔄 Reset All', value: 'reset' }
+      ]}
     ]
   }
 ];
@@ -151,6 +242,7 @@ const log = (msg, level = 'INFO') => {
   const config = getConfig();
   if (config.features.enableLogging) {
     try {
+      const fs = require('fs');
       const logDir = path.join(__dirname, 'logs');
       if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
       fs.appendFileSync(path.join(logDir, `bot-${new Date().toISOString().split('T')[0]}.log`), logMsg + '\n');
@@ -232,6 +324,139 @@ const createRunEmbed = (run, title = '📊 Workflow Status') => {
     .setTimestamp();
 };
 
+// Create configuration modal
+const createConfigModal = (currentConfig) => {
+  const modal = new ModalBuilder()
+    .setCustomId('configModal')
+    .setTitle('🔧 Complete Bot Configuration');
+
+  // GitHub Configuration
+  const githubToken = new TextInputBuilder()
+    .setCustomId('githubToken')
+    .setLabel('GitHub Token (⚠️ Sensitive)')
+    .setPlaceholder('ghp_xxxxxxxxxxxxxxxxxxxx')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.githubToken || '');
+
+  const repoOwner = new TextInputBuilder()
+    .setCustomId('repoOwner')
+    .setLabel('GitHub Repository Owner')
+    .setPlaceholder('e.g., Shebyyy')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.repo?.owner || '');
+
+  const repoName = new TextInputBuilder()
+    .setCustomId('repoName')
+    .setLabel('GitHub Repository Name')
+    .setPlaceholder('e.g., Dartotsu')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.repo?.name || '');
+
+  const workflowFile = new TextInputBuilder()
+    .setCustomId('workflowFile')
+    .setLabel('Workflow File Name')
+    .setPlaceholder('e.g., dart.yml')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.repo?.workflowFile || '');
+
+  const branch = new TextInputBuilder()
+    .setCustomId('branch')
+    .setLabel('Default Branch')
+    .setPlaceholder('e.g., main')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.repo?.branch || '');
+
+  // Discord Configuration
+  const discordToken = new TextInputBuilder()
+    .setCustomId('discordToken')
+    .setLabel('Discord Bot Token (⚠️ Sensitive)')
+    .setPlaceholder('MTAxNzE5MjM4MzU2MjY3NjY4NA.G...')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.discordToken || '');
+
+  const guildId = new TextInputBuilder()
+    .setCustomId('guildId')
+    .setLabel('Server ID (Optional - for guild commands)')
+    .setPlaceholder('e.g., 123456789012345678')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.guildId || '');
+
+  const allowedRoles = new TextInputBuilder()
+    .setCustomId('allowedRoles')
+    .setLabel('Allowed Role IDs (comma-separated)')
+    .setPlaceholder('e.g., 123456789,987654321 or @Role1,@Role2')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.discord?.allowedRoleIds?.join(',') || '');
+
+  const logChannel = new TextInputBuilder()
+    .setCustomId('logChannel')
+    .setLabel('Log Channel ID or #channel')
+    .setPlaceholder('e.g., #bot-logs or 123456789')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.discord?.logChannelId || '');
+
+  // Feature Toggles
+  const requirePermissions = new TextInputBuilder()
+    .setCustomId('requirePermissions')
+    .setLabel('Require Permissions? (true/false)')
+    .setPlaceholder('true or false')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.features?.requirePermissions?.toString() || 'false');
+
+  const enableLogging = new TextInputBuilder()
+    .setCustomId('enableLogging')
+    .setLabel('Enable File Logging? (true/false)')
+    .setPlaceholder('true or false')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.features?.enableLogging?.toString() || 'false');
+
+  const autoRefresh = new TextInputBuilder()
+    .setCustomId('autoRefresh')
+    .setLabel('Auto-Refresh Status? (true/false)')
+    .setPlaceholder('true or false')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.features?.autoRefreshStatus?.toString() || 'false');
+
+  const refreshInterval = new TextInputBuilder()
+    .setCustomId('refreshInterval')
+    .setLabel('Refresh Interval (milliseconds)')
+    .setPlaceholder('e.g., 30000 (30 seconds)')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.features?.refreshInterval?.toString() || '30000');
+
+  // Add all components to modal
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(githubToken),
+    new ActionRowBuilder().addComponents(discordToken),
+    new ActionRowBuilder().addComponents(repoOwner),
+    new ActionRowBuilder().addComponents(repoName),
+    new ActionRowBuilder().addComponents(workflowFile),
+    new ActionRowBuilder().addComponents(branch),
+    new ActionRowBuilder().addComponents(guildId),
+    new ActionRowBuilder().addComponents(allowedRoles),
+    new ActionRowBuilder().addComponents(logChannel),
+    new ActionRowBuilder().addComponents(requirePermissions),
+    new ActionRowBuilder().addComponents(enableLogging),
+    new ActionRowBuilder().addComponents(autoRefresh),
+    new ActionRowBuilder().addComponents(refreshInterval)
+  );
+
+  return modal;
+};
+
 // ================================
 // COMMAND HANDLERS
 // ================================
@@ -242,7 +467,7 @@ const handleBuild = async (interaction) => {
   // Check if repository is configured
   if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile || !config.repo.branch) {
     return await interaction.editReply({ 
-      content: '❌ Repository not configured. Use `/config action:set key:repo value:owner/name` and set workflow/branch', 
+      content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
       ephemeral: true 
     });
   }
@@ -302,7 +527,7 @@ const handleStatus = async (interaction) => {
   // Check if repository is configured
   if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile) {
     return await interaction.editReply({ 
-      content: '❌ Repository not configured. Use `/config action:set key:repo value:owner/name` first', 
+      content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
       ephemeral: true 
     });
   }
@@ -365,7 +590,7 @@ const handleCancel = async (interaction) => {
   // Check if repository is configured
   if (!config.repo.owner || !config.repo.name) {
     return await interaction.editReply({ 
-      content: '❌ Repository not configured. Use `/config action:set key:repo value:owner/name` first', 
+      content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
       ephemeral: true 
     });
   }
@@ -406,7 +631,7 @@ const handleLogs = async (interaction) => {
   // Check if repository is configured
   if (!config.repo.owner || !config.repo.name) {
     return await interaction.editReply({ 
-      content: '❌ Repository not configured. Use `/config action:set key:repo value:owner/name` first', 
+      content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
       ephemeral: true 
     });
   }
@@ -443,7 +668,7 @@ const handleArtifacts = async (interaction) => {
   // Check if repository is configured
   if (!config.repo.owner || !config.repo.name) {
     return await interaction.editReply({ 
-      content: '❌ Repository not configured. Use `/config action:set key:repo value:owner/name` first', 
+      content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
       ephemeral: true 
     });
   }
@@ -486,7 +711,7 @@ const handleHistory = async (interaction) => {
   // Check if repository is configured
   if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile) {
     return await interaction.editReply({ 
-      content: '❌ Repository not configured. Use `/config action:set key:repo value:owner/name` first', 
+      content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
       ephemeral: true 
     });
   }
@@ -598,7 +823,7 @@ const handleHelp = async (interaction) => {
       { name: '📦 /list-artifacts', value: '`/list-artifacts`\nList build files', inline: false },
       { name: '📈 /workflow-history', value: '`/workflow-history days:30`\nView stats', inline: false },
       { name: '🤖 /bot-info', value: 'Bot information', inline: false },
-      { name: '⚙️ /config', value: '`/config action:view`\nManage bot settings (Admin only)', inline: false }
+      { name: '⚙️ /config', value: '`/config action:configure`\nManage bot settings (Admin only)', inline: false }
     )
     .setFooter({ text: 'Most params are optional!' })
     .setTimestamp();
@@ -607,23 +832,14 @@ const handleHelp = async (interaction) => {
 };
 
 const handleConfig = async (interaction) => {
-  await interaction.deferReply({ ephemeral: true });
-  
-  // Check if user has admin permissions
-  if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
-    return await interaction.editReply({ content: '❌ Only administrators can manage configuration', ephemeral: true });
-  }
-  
   const action = interaction.options.getString('action');
-  const key = interaction.options.getString('key');
-  const value = interaction.options.getString('value');
   
   if (action === 'view') {
-    // Display current configuration
+    await interaction.deferReply({ ephemeral: true });
     const config = getConfig();
     const embed = new EmbedBuilder()
       .setColor(COLORS.info)
-      .setTitle('⚙️ Bot Configuration')
+      .setTitle('⚙️ Bot Configuration (Database Storage)')
       .addFields(
         { name: '📦 Repository', value: config.repo.owner && config.repo.name ? 
           `${config.repo.owner}/${config.repo.name}` : 'Not configured', inline: true },
@@ -635,85 +851,29 @@ const handleConfig = async (interaction) => {
         { name: '⏱️ Refresh Interval', value: `${config.features.refreshInterval}ms`, inline: true },
         { name: '📢 Log Channel', value: config.discord.logChannelId ? `<#${config.discord.logChannelId}>` : 'None', inline: true },
         { name: '👥 Allowed Roles', value: config.discord.allowedRoleIds.length > 0 ? 
-          config.discord.allowedRoleIds.map(id => `<@&${id}>`).join(', ') : 'None', inline: true }
+          config.discord.allowedRoleIds.map(id => `<@&${id}>`).join(', ') : 'None', inline: true },
+        { name: '🔑 Tokens', value: config.githubToken && config.discordToken ? '✅ Set' : '❌ Missing', inline: true },
+        { name: '🌐 Guild ID', value: config.guildId || 'Global commands', inline: true }
       )
+      .setFooter({ text: '🗄️ Stored in database - persists until reset' })
       .setTimestamp();
     
     return await interaction.editReply({ embeds: [embed], ephemeral: true });
   } 
-  else if (action === 'set') {
-    if (!key || !value) {
-      return await interaction.editReply({ content: '❌ Both key and value are required for setting configuration', ephemeral: true });
-    }
-    
-    // Update configuration based on key
-    switch (key) {
-      case 'repo':
-        const [owner, name] = value.split('/');
-        if (!owner || !name) {
-          return await interaction.editReply({ content: '❌ Invalid repository format. Use owner/name', ephemeral: true });
-        }
-        botConfig.repo.owner = owner;
-        botConfig.repo.name = name;
-        break;
-        
-      case 'workflow':
-        botConfig.repo.workflowFile = value;
-        break;
-        
-      case 'branch':
-        botConfig.repo.branch = value;
-        break;
-        
-      case 'allowedRoles':
-        botConfig.discord.allowedRoleIds = value.split(',').map(id => id.trim().replace(/[<@&>]/g, ''));
-        break;
-        
-      case 'logChannel':
-        botConfig.discord.logChannelId = value.replace(/[<#>]/g, '');
-        break;
-        
-      case 'requirePermissions':
-        botConfig.features.requirePermissions = value.toLowerCase() === 'true';
-        break;
-        
-      case 'enableLogging':
-        botConfig.features.enableLogging = value.toLowerCase() === 'true';
-        break;
-        
-      case 'autoRefresh':
-        botConfig.features.autoRefreshStatus = value.toLowerCase() === 'true';
-        break;
-        
-      case 'refreshInterval':
-        const interval = parseInt(value);
-        if (isNaN(interval) || interval < 5000) {
-          return await interaction.editReply({ content: '❌ Invalid refresh interval. Must be a number in milliseconds (min: 5000)', ephemeral: true });
-        }
-        botConfig.features.refreshInterval = interval;
-        break;
-        
-      default:
-        return await interaction.editReply({ content: '❌ Unknown configuration key', ephemeral: true });
-    }
-    
-    // Save the updated configuration
-    if (await saveConfig()) {
-      const embed = new EmbedBuilder()
-        .setColor(COLORS.success)
-        .setTitle('✅ Configuration Updated')
-        .setDescription(`Successfully updated \`${key}\` to \`${value}\``)
-        .setTimestamp();
-      
-      await interaction.editReply({ embeds: [embed], ephemeral: true });
-      await sendLog(`⚙️ Configuration updated by ${interaction.user.tag}`, embed);
-    } else {
-      await interaction.editReply({ content: '❌ Failed to save configuration', ephemeral: true });
-    }
-  } 
+  else if (action === 'configure') {
+    const modal = createConfigModal(getConfig());
+    await interaction.showModal(modal);
+  }
   else if (action === 'reset') {
-    // Reset to empty values
+    await interaction.deferReply({ ephemeral: true });
+    
+    // Reset database and memory
+    await resetConfigInDB();
+    
     botConfig = {
+      githubToken: process.env.GITHUB_TOKEN || null,
+      discordToken: process.env.DISCORD_TOKEN || null,
+      guildId: process.env.GUILD_ID || null,
       repo: { owner: null, name: null, workflowFile: null, branch: null },
       discord: {
         allowedRoleIds: [],
@@ -727,18 +887,15 @@ const handleConfig = async (interaction) => {
       }
     };
     
-    if (await saveConfig()) {
-      const embed = new EmbedBuilder()
-        .setColor(COLORS.success)
-        .setTitle('🔄 Configuration Reset')
-        .setDescription('Configuration has been reset to empty values')
-        .setTimestamp();
-      
-      await interaction.editReply({ embeds: [embed], ephemeral: true });
-      await sendLog(`🔄 Configuration reset by ${interaction.user.tag}`, embed);
-    } else {
-      await interaction.editReply({ content: '❌ Failed to reset configuration', ephemeral: true });
-    }
+    const embed = new EmbedBuilder()
+      .setColor(COLORS.success)
+      .setTitle('🔄 Configuration Reset')
+      .setDescription('Configuration has been reset to environment variables')
+      .setFooter({ text: 'Database cleared - all settings removed' })
+      .setTimestamp();
+    
+    await interaction.editReply({ embeds: [embed], ephemeral: true });
+    await sendLog(`🔄 Configuration reset by ${interaction.user.tag}`, embed);
   }
 };
 
@@ -799,8 +956,9 @@ const handleButton = async (interaction) => {
 // EVENT HANDLERS
 // ================================
 client.once('ready', async () => {
-  // Load configuration from file
-  await loadConfig();
+  // Initialize and load database
+  await initDatabase();
+  await loadConfigFromDB();
   
   log(`✅ ${client.user.tag} ready`, 'INFO');
   client.user.setActivity('GitHub Actions 🚀', { type: 3 });
@@ -809,12 +967,13 @@ client.once('ready', async () => {
   
   try {
     log('🔄 Registering commands...', 'INFO');
-    const route = process.env.GUILD_ID 
-      ? Routes.applicationGuildCommands(client.user.id, process.env.GUILD_ID)
+    const config = getConfig();
+    const route = config.guildId 
+      ? Routes.applicationGuildCommands(client.user.id, config.guildId)
       : Routes.applicationCommands(client.user.id);
     
     await rest.put(route, { body: commands });
-    log(`✅ Registered ${commands.length} ${process.env.GUILD_ID ? 'guild' : 'global'} commands`, 'INFO');
+    log(`✅ Registered ${commands.length} ${config.guildId ? 'guild' : 'global'} commands`, 'INFO');
     log(`🤖 Serving ${client.guilds.cache.size} server(s)`, 'INFO');
   } catch (error) {
     log(`❌ Command registration error: ${error.message}`, 'ERROR');
@@ -823,8 +982,88 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async (interaction) => {
   try {
-    if (interaction.isChatInputCommand()) {
-      // Skip permission check for config command (we'll check admin permissions inside)
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === 'configModal') {
+        await interaction.deferReply({ ephemeral: true });
+        
+        // Get all modal values
+        const githubToken = interaction.fields.getTextInputValue('githubToken').trim();
+        const discordToken = interaction.fields.getTextInputValue('discordToken').trim();
+        const guildId = interaction.fields.getTextInputValue('guildId').trim();
+        const repoOwner = interaction.fields.getTextInputValue('repoOwner').trim();
+        const repoName = interaction.fields.getTextInputValue('repoName').trim();
+        const workflowFile = interaction.fields.getTextInputValue('workflowFile').trim();
+        const branch = interaction.fields.getTextInputValue('branch').trim();
+        const allowedRoles = interaction.fields.getTextInputValue('allowedRoles').trim();
+        const logChannel = interaction.fields.getTextInputValue('logChannel').trim();
+        const requirePermissions = interaction.fields.getTextInputValue('requirePermissions').trim().toLowerCase();
+        const enableLogging = interaction.fields.getTextInputValue('enableLogging').trim().toLowerCase();
+        const autoRefresh = interaction.fields.getTextInputValue('autoRefresh').trim().toLowerCase();
+        const refreshInterval = interaction.fields.getTextInputValue('refreshInterval').trim();
+        
+        // Update configuration
+        if (githubToken) botConfig.githubToken = githubToken;
+        if (discordToken) botConfig.discordToken = discordToken;
+        if (guildId) botConfig.guildId = guildId;
+        if (repoOwner) botConfig.repo.owner = repoOwner;
+        if (repoName) botConfig.repo.name = repoName;
+        if (workflowFile) botConfig.repo.workflowFile = workflowFile;
+        if (branch) botConfig.repo.branch = branch;
+        
+        if (allowedRoles) {
+          botConfig.discord.allowedRoleIds = allowedRoles.split(',')
+            .map(id => id.trim().replace(/[<@&>]/g, ''))
+            .filter(id => id);
+        }
+        
+        if (logChannel) {
+          botConfig.discord.logChannelId = logChannel.replace(/[<#>]/g, '');
+        }
+        
+        if (requirePermissions === 'true' || requirePermissions === 'false') {
+          botConfig.features.requirePermissions = requirePermissions === 'true';
+        }
+        
+        if (enableLogging === 'true' || enableLogging === 'false') {
+          botConfig.features.enableLogging = enableLogging === 'true';
+        }
+        
+        if (autoRefresh === 'true' || autoRefresh === 'false') {
+          botConfig.features.autoRefreshStatus = autoRefresh === 'true';
+        }
+        
+        if (refreshInterval) {
+          const interval = parseInt(refreshInterval);
+          if (!isNaN(interval) && interval >= 5000) {
+            botConfig.features.refreshInterval = interval;
+          }
+        }
+        
+        // Save to database
+        if (await saveAllConfigToDB()) {
+          const embed = new EmbedBuilder()
+            .setColor(COLORS.success)
+            .setTitle('✅ Configuration Updated')
+            .setDescription('Your configuration has been saved to database!')
+            .addFields(
+              { name: '📦 Repository', value: botConfig.repo.owner && botConfig.repo.name ? 
+                `${botConfig.repo.owner}/${botConfig.repo.name}` : 'Not set', inline: true },
+              { name: '🔧 Workflow', value: botConfig.repo.workflowFile || 'Not set', inline: true },
+              { name: '🌿 Branch', value: botConfig.repo.branch || 'Not set', inline: true },
+              { name: '🔑 Tokens', value: (botConfig.githubToken && botConfig.discordToken) ? '✅ Set' : '❌ Missing', inline: true }
+            )
+            .setFooter({ text: '🗄️ Stored securely in database' })
+            .setTimestamp();
+          
+          await interaction.editReply({ embeds: [embed], ephemeral: true });
+          await sendLog(`⚙️ Configuration updated by ${interaction.user.tag}`, embed);
+        } else {
+          await interaction.editReply({ content: '❌ Failed to save configuration', ephemeral: true });
+        }
+      }
+    }
+    else if (interaction.isChatInputCommand()) {
+      // Skip permission check for config command (Discord handles it)
       if (interaction.commandName !== 'config' && !await checkPermissions(interaction)) return;
 
       const handlers = {
@@ -857,15 +1096,36 @@ client.on('interactionCreate', async (interaction) => {
 
 client.on('error', error => log(`Client error: ${error.message}`, 'ERROR'));
 process.on('unhandledRejection', error => log(`Unhandled rejection: ${error.message}`, 'ERROR'));
-process.on('SIGINT', () => { log('SIGINT - shutting down', 'INFO'); client.destroy(); process.exit(0); });
-process.on('SIGTERM', () => { log('SIGTERM - shutting down', 'INFO'); client.destroy(); process.exit(0); });
+process.on('SIGINT', () => { log('SIGINT - shutting down', 'INFO'); db.close(); client.destroy(); process.exit(0); });
+process.on('SIGTERM', () => { log('SIGTERM - shutting down', 'INFO'); db.close(); client.destroy(); process.exit(0); });
 
 // ================================
 // START BOT
 // ================================
-if (!process.env.DISCORD_TOKEN) { console.error('❌ DISCORD_TOKEN missing'); process.exit(1); }
-if (!process.env.GITHUB_TOKEN) { console.error('❌ GITHUB_TOKEN missing'); process.exit(1); }
+const startBot = async () => {
+  await initDatabase();
+  await loadConfigFromDB();
+  const config = getConfig();
+  
+  // Use config tokens or environment variables
+  const discordToken = config.discordToken || process.env.DISCORD_TOKEN;
+  const githubToken = config.githubToken || process.env.GITHUB_TOKEN;
+  
+  if (!discordToken) { 
+    console.error('❌ Discord Token not configured. Use /config action:configure to set it'); 
+    process.exit(1); 
+  }
+  if (!githubToken) { 
+    console.error('❌ GitHub Token not configured. Use /config action:configure to set it'); 
+    process.exit(1); 
+  }
+  
+  // Update Octokit with token
+  octokit.auth = githubToken;
+  
+  client.login(discordToken)
+    .then(() => log('🚀 Login initiated', 'INFO'))
+    .catch(error => { log(`Login failed: ${error.message}`, 'ERROR'); process.exit(1); });
+};
 
-client.login(process.env.DISCORD_TOKEN)
-  .then(() => log('🚀 Login initiated', 'INFO'))
-  .catch(error => { log(`Login failed: ${error.message}`, 'ERROR'); process.exit(1); });
+startBot();
