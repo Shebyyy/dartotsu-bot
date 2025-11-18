@@ -1,14 +1,22 @@
 {
   "name": "dartotsu-discord-bot",
-  "version": "1.0.0",
-  "description": "Discord bot for triggering Dartotsu builds via GitHub Actions",
+  "version": "2.0.0",
+  "description": "Enhanced Discord bot for triggering Dartotsu builds via GitHub Actions",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
     "dev": "nodemon bot.js",
-    "test": "node bot.js"
+    "test": "node bot.js",
+    "logs": "tail -f logs/bot-$(date +%Y-%m-%d).log"
   },
-  "keywords": ["discord", "bot", "github-actions", "dartotsu"],
+  "keywords": [
+    "discord",
+    "bot",
+    "github-actions",
+    "dartotsu",
+    "ci-cd",
+    "automation"
+  ],
   "author": "Sheby",
   "license": "MIT",
   "dependencies": {
@@ -23,5 +31,12 @@
   },
   "engines": {
     "node": ">=16.5.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Shebyyy/dartotsu-bot"
+  },
+  "bugs": {
+    "url": "https://github.com/Shebyyy/dartotsu-bot/issues"
   }
 }
