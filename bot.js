@@ -21,7 +21,7 @@ if (typeof ReadableStream === 'undefined') {
 }
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, REST, Routes, EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, MessageFlags } = require('discord.js');
 const { Octokit } = require('@octokit/rest');
 const { Pool } = require('pg');
 const path = require('path');
@@ -37,7 +37,7 @@ const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN, request: { fetch: 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/botdb',
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-  max: 20, // Maximum number of clients in the pool
+  max: 20, // Maximum number of clients in pool
   idleTimeoutMillis: 30000, // How long a client is allowed to remain idle before being closed
   connectionTimeoutMillis: 2000, // How long to wait when connecting a new client
 });
@@ -282,7 +282,7 @@ const checkPermissions = async (interaction) => {
       !config.features.requirePermissions || 
       config.discord.allowedRoleIds.length === 0 ||
       interaction.member.roles.cache.some(role => config.discord.allowedRoleIds.includes(role.id))) return true;
-  await interaction.reply({ content: '❌ No permission', ephemeral: true });
+  await interaction.reply({ content: '❌ No permission', flags: [MessageFlags.Ephemeral] });
   return false;
 };
 
@@ -350,13 +350,13 @@ const createRunEmbed = (run, title = '📊 Workflow Status') => {
     .setTimestamp();
 };
 
-// Create configuration modal
+// Create configuration modal (FIXED - only 5 ActionRows)
 const createConfigModal = (currentConfig) => {
   const modal = new ModalBuilder()
     .setCustomId('configModal')
-    .setTitle('🔧 Complete Bot Configuration');
+    .setTitle('🔧 Bot Configuration');
 
-  // GitHub Configuration
+  // Row 1: GitHub Token
   const githubToken = new TextInputBuilder()
     .setCustomId('githubToken')
     .setLabel('GitHub Token (⚠️ Sensitive)')
@@ -365,39 +365,7 @@ const createConfigModal = (currentConfig) => {
     .setRequired(false)
     .setValue(currentConfig.githubToken || '');
 
-  const repoOwner = new TextInputBuilder()
-    .setCustomId('repoOwner')
-    .setLabel('GitHub Repository Owner')
-    .setPlaceholder('e.g., Shebyyy')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.repo?.owner || '');
-
-  const repoName = new TextInputBuilder()
-    .setCustomId('repoName')
-    .setLabel('GitHub Repository Name')
-    .setPlaceholder('e.g., Dartotsu')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.repo?.name || '');
-
-  const workflowFile = new TextInputBuilder()
-    .setCustomId('workflowFile')
-    .setLabel('Workflow File Name')
-    .setPlaceholder('e.g., dart.yml')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.repo?.workflowFile || '');
-
-  const branch = new TextInputBuilder()
-    .setCustomId('branch')
-    .setLabel('Default Branch')
-    .setPlaceholder('e.g., main')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.repo?.branch || '');
-
-  // Discord Configuration
+  // Row 2: Discord Token
   const discordToken = new TextInputBuilder()
     .setCustomId('discordToken')
     .setLabel('Discord Bot Token (⚠️ Sensitive)')
@@ -406,78 +374,53 @@ const createConfigModal = (currentConfig) => {
     .setRequired(false)
     .setValue(currentConfig.discordToken || '');
 
-  const guildId = new TextInputBuilder()
-    .setCustomId('guildId')
-    .setLabel('Server ID (Optional - for guild commands)')
-    .setPlaceholder('e.g., 123456789012345678')
-    .setStyle(TextInputStyle.Short)
+  // Row 3: Repository Info (combined)
+  const repoInfo = new TextInputBuilder()
+    .setCustomId('repoInfo')
+    .setLabel('Repository (owner/name) and Workflow')
+    .setPlaceholder('Repository: owner/name\nWorkflow: dart.yml\nBranch: main')
+    .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
-    .setValue(currentConfig.guildId || '');
+    .setValue(
+      `Repository: ${currentConfig.repo?.owner || ''}/${currentConfig.repo?.name || ''}\n` +
+      `Workflow: ${currentConfig.repo?.workflowFile || ''}\n` +
+      `Branch: ${currentConfig.repo?.branch || ''}`
+    );
 
-  const allowedRoles = new TextInputBuilder()
-    .setCustomId('allowedRoles')
-    .setLabel('Allowed Role IDs (comma-separated)')
-    .setPlaceholder('e.g., 123456789,987654321 or @Role1,@Role2')
-    .setStyle(TextInputStyle.Short)
+  // Row 4: Discord Settings (combined)
+  const discordSettings = new TextInputBuilder()
+    .setCustomId('discordSettings')
+    .setLabel('Discord Settings')
+    .setPlaceholder('Guild ID: 123456789012345678\nLog Channel: #bot-logs\nAllowed Roles: @Role1,@Role2 or 123,456')
+    .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
-    .setValue(currentConfig.discord?.allowedRoleIds?.join(',') || '');
+    .setValue(
+      `Guild ID: ${currentConfig.guildId || ''}\n` +
+      `Log Channel: ${currentConfig.discord?.logChannelId ? `#${currentConfig.discord.logChannelId}` : ''}\n` +
+      `Allowed Roles: ${currentConfig.discord?.allowedRoleIds?.map(id => `<@&${id}>`).join(',') || ''}`
+    );
 
-  const logChannel = new TextInputBuilder()
-    .setCustomId('logChannel')
-    .setLabel('Log Channel ID or #channel')
-    .setPlaceholder('e.g., #bot-logs or 123456789')
-    .setStyle(TextInputStyle.Short)
+  // Row 5: Feature Toggles (combined)
+  const features = new TextInputBuilder()
+    .setCustomId('features')
+    .setLabel('Features (true/false)')
+    .setPlaceholder('Require Permissions: true\nEnable Logging: false\nAuto Refresh: true\nRefresh Interval: 30000')
+    .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
-    .setValue(currentConfig.discord?.logChannelId || '');
+    .setValue(
+      `Require Permissions: ${currentConfig.features?.requirePermissions || false}\n` +
+      `Enable Logging: ${currentConfig.features?.enableLogging || false}\n` +
+      `Auto Refresh: ${currentConfig.features?.autoRefreshStatus || false}\n` +
+      `Refresh Interval: ${currentConfig.features?.refreshInterval || 30000}`
+    );
 
-  // Feature Toggles
-  const requirePermissions = new TextInputBuilder()
-    .setCustomId('requirePermissions')
-    .setLabel('Require Permissions? (true/false)')
-    .setPlaceholder('true or false')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.features?.requirePermissions?.toString() || 'false');
-
-  const enableLogging = new TextInputBuilder()
-    .setCustomId('enableLogging')
-    .setLabel('Enable File Logging? (true/false)')
-    .setPlaceholder('true or false')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.features?.enableLogging?.toString() || 'false');
-
-  const autoRefresh = new TextInputBuilder()
-    .setCustomId('autoRefresh')
-    .setLabel('Auto-Refresh Status? (true/false)')
-    .setPlaceholder('true or false')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.features?.autoRefreshStatus?.toString() || 'false');
-
-  const refreshInterval = new TextInputBuilder()
-    .setCustomId('refreshInterval')
-    .setLabel('Refresh Interval (milliseconds)')
-    .setPlaceholder('e.g., 30000 (30 seconds)')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.features?.refreshInterval?.toString() || '30000');
-
-  // Add all components to modal
+  // Add only 5 rows (Discord limit)
   modal.addComponents(
     new ActionRowBuilder().addComponents(githubToken),
     new ActionRowBuilder().addComponents(discordToken),
-    new ActionRowBuilder().addComponents(repoOwner),
-    new ActionRowBuilder().addComponents(repoName),
-    new ActionRowBuilder().addComponents(workflowFile),
-    new ActionRowBuilder().addComponents(branch),
-    new ActionRowBuilder().addComponents(guildId),
-    new ActionRowBuilder().addComponents(allowedRoles),
-    new ActionRowBuilder().addComponents(logChannel),
-    new ActionRowBuilder().addComponents(requirePermissions),
-    new ActionRowBuilder().addComponents(enableLogging),
-    new ActionRowBuilder().addComponents(autoRefresh),
-    new ActionRowBuilder().addComponents(refreshInterval)
+    new ActionRowBuilder().addComponents(repoInfo),
+    new ActionRowBuilder().addComponents(discordSettings),
+    new ActionRowBuilder().addComponents(features)
   );
 
   return modal;
@@ -494,7 +437,7 @@ const handleBuild = async (interaction) => {
   if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile || !config.repo.branch) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
-      ephemeral: true 
+      flags: [MessageFlags.Ephemeral] 
     });
   }
   
@@ -554,7 +497,7 @@ const handleStatus = async (interaction) => {
   if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
-      ephemeral: true 
+      flags: [MessageFlags.Ephemeral] 
     });
   }
   
@@ -617,7 +560,7 @@ const handleCancel = async (interaction) => {
   if (!config.repo.owner || !config.repo.name) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
-      ephemeral: true 
+      flags: [MessageFlags.Ephemeral] 
     });
   }
   
@@ -658,7 +601,7 @@ const handleLogs = async (interaction) => {
   if (!config.repo.owner || !config.repo.name) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
-      ephemeral: true 
+      flags: [MessageFlags.Ephemeral] 
     });
   }
   
@@ -695,7 +638,7 @@ const handleArtifacts = async (interaction) => {
   if (!config.repo.owner || !config.repo.name) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
-      ephemeral: true 
+      flags: [MessageFlags.Ephemeral] 
     });
   }
   
@@ -738,7 +681,7 @@ const handleHistory = async (interaction) => {
   if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
-      ephemeral: true 
+      flags: [MessageFlags.Ephemeral] 
     });
   }
   
@@ -855,14 +798,14 @@ const handleHelp = async (interaction) => {
     .setFooter({ text: 'Most params are optional!' })
     .setTimestamp();
 
-  await interaction.reply({ embeds: [embed], ephemeral: true });
+  await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
 };
 
 const handleConfig = async (interaction) => {
   const action = interaction.options.getString('action');
   
   if (action === 'view') {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
     const config = getConfig();
     const embed = new EmbedBuilder()
       .setColor(COLORS.info)
@@ -885,14 +828,14 @@ const handleConfig = async (interaction) => {
       .setFooter({ text: '🗄️ Stored in PostgreSQL - persists until reset' })
       .setTimestamp();
     
-    return await interaction.editReply({ embeds: [embed], ephemeral: true });
+    return await interaction.editReply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
   } 
   else if (action === 'configure') {
     const modal = createConfigModal(getConfig());
     await interaction.showModal(modal);
   }
   else if (action === 'reset') {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
     
     // Reset database and memory
     await resetConfigInDB();
@@ -921,7 +864,7 @@ const handleConfig = async (interaction) => {
       .setFooter({ text: 'PostgreSQL database cleared - all settings removed' })
       .setTimestamp();
     
-    await interaction.editReply({ embeds: [embed], ephemeral: true });
+    await interaction.editReply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     await sendLog(`🔄 Configuration reset by ${interaction.user.tag}`, embed);
   }
 };
@@ -939,11 +882,11 @@ const handleButton = async (interaction) => {
       await octokit.actions.cancelWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: runId });
       const embed = EmbedBuilder.from(interaction.message.embeds[0]).setColor(COLORS.cancelled).setFooter({ text: `Cancelled by ${interaction.user.tag}` });
       await interaction.editReply({ embeds: [embed], components: [] });
-      await interaction.followUp({ content: '✅ Cancelled!', ephemeral: true });
+      await interaction.followUp({ content: '✅ Cancelled!', flags: [MessageFlags.Ephemeral] });
       log(`Button cancel ${runId} by ${interaction.user.tag}`, 'INFO');
     } catch (error) {
       log(`Button cancel error: ${error.message}`, 'ERROR');
-      await interaction.followUp({ content: `❌ Failed: ${error.message}`, ephemeral: true });
+      await interaction.followUp({ content: `❌ Failed: ${error.message}`, flags: [MessageFlags.Ephemeral] });
     }
   } else if (action === 'refresh') {
     await interaction.deferUpdate();
@@ -970,11 +913,11 @@ const handleButton = async (interaction) => {
       await interaction.editReply({ embeds: [embed], components });
       
       if (run.status === 'completed') {
-        await interaction.followUp({ content: `${EMOJI.conclusion[run.conclusion] || '✅'} Build ${run.conclusion}!`, ephemeral: true });
+        await interaction.followUp({ content: `${EMOJI.conclusion[run.conclusion] || '✅'} Build ${run.conclusion}!`, flags: [MessageFlags.Ephemeral] });
       }
     } catch (error) {
       log(`Button refresh error: ${error.message}`, 'ERROR');
-      await interaction.followUp({ content: `❌ Failed: ${error.message}`, ephemeral: true });
+      await interaction.followUp({ content: `❌ Failed: ${error.message}`, flags: [MessageFlags.Ephemeral] });
     }
   }
 };
@@ -1018,60 +961,85 @@ client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isModalSubmit()) {
       if (interaction.customId === 'configModal') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
-        // Get all modal values
+        // Get combined field values
         const githubToken = interaction.fields.getTextInputValue('githubToken').trim();
         const discordToken = interaction.fields.getTextInputValue('discordToken').trim();
-        const guildId = interaction.fields.getTextInputValue('guildId').trim();
-        const repoOwner = interaction.fields.getTextInputValue('repoOwner').trim();
-        const repoName = interaction.fields.getTextInputValue('repoName').trim();
-        const workflowFile = interaction.fields.getTextInputValue('workflowFile').trim();
-        const branch = interaction.fields.getTextInputValue('branch').trim();
-        const allowedRoles = interaction.fields.getTextInputValue('allowedRoles').trim();
-        const logChannel = interaction.fields.getTextInputValue('logChannel').trim();
-        const requirePermissions = interaction.fields.getTextInputValue('requirePermissions').trim().toLowerCase();
-        const enableLogging = interaction.fields.getTextInputValue('enableLogging').trim().toLowerCase();
-        const autoRefresh = interaction.fields.getTextInputValue('autoRefresh').trim().toLowerCase();
-        const refreshInterval = interaction.fields.getTextInputValue('refreshInterval').trim();
+        const repoInfo = interaction.fields.getTextInputValue('repoInfo').trim();
+        const discordSettings = interaction.fields.getTextInputValue('discordSettings').trim();
+        const features = interaction.fields.getTextInputValue('features').trim();
         
-        // Update configuration
-        if (githubToken) botConfig.githubToken = githubToken;
-        if (discordToken) botConfig.discordToken = discordToken;
-        if (guildId) botConfig.guildId = guildId;
-        if (repoOwner) botConfig.repo.owner = repoOwner;
-        if (repoName) botConfig.repo.name = repoName;
-        if (workflowFile) botConfig.repo.workflowFile = workflowFile;
-        if (branch) botConfig.repo.branch = branch;
+        // Parse repository info
+        const repoLines = repoInfo.split('\n');
+        let repoOwner = '', repoName = '', workflowFile = '', branch = '';
+        repoLines.forEach(line => {
+          if (line.startsWith('Repository:')) {
+            const repo = line.replace('Repository:', '').trim();
+            if (repo.includes('/')) {
+              [repoOwner, repoName] = repo.split('/');
+            }
+          } else if (line.startsWith('Workflow:')) {
+            workflowFile = line.replace('Workflow:', '').trim();
+          } else if (line.startsWith('Branch:')) {
+            branch = line.replace('Branch:', '').trim();
+          }
+        });
         
-        if (allowedRoles) {
-          botConfig.discord.allowedRoleIds = allowedRoles.split(',')
+        // Parse Discord settings
+        const discordLines = discordSettings.split('\n');
+        let guildId = '', logChannelId = '', allowedRolesStr = '';
+        discordLines.forEach(line => {
+          if (line.startsWith('Guild ID:')) {
+            guildId = line.replace('Guild ID:', '').trim();
+          } else if (line.startsWith('Log Channel:')) {
+            logChannelId = line.replace('Log Channel:', '').trim().replace(/[<#>]/g, '');
+          } else if (line.startsWith('Allowed Roles:')) {
+            allowedRolesStr = line.replace('Allowed Roles:', '').trim();
+          }
+        });
+        
+        // Parse features
+        const featureLines = features.split('\n');
+        let requirePermissions = false, enableLogging = false, autoRefresh = false, refreshInterval = 30000;
+        featureLines.forEach(line => {
+          if (line.startsWith('Require Permissions:')) {
+            requirePermissions = line.replace('Require Permissions:', '').trim().toLowerCase() === 'true';
+          } else if (line.startsWith('Enable Logging:')) {
+            enableLogging = line.replace('Enable Logging:', '').trim().toLowerCase() === 'true';
+          } else if (line.startsWith('Auto Refresh:')) {
+            autoRefresh = line.replace('Auto Refresh:', '').trim().toLowerCase() === 'true';
+          } else if (line.startsWith('Refresh Interval:')) {
+            const interval = parseInt(line.replace('Refresh Interval:', '').trim());
+            if (!isNaN(interval) && interval >= 5000) {
+              refreshInterval = interval;
+            }
+          }
+        });
+        
+        // Parse allowed roles
+        let allowedRoleIds = [];
+        if (allowedRolesStr) {
+          allowedRoleIds = allowedRolesStr.split(',')
             .map(id => id.trim().replace(/[<@&>]/g, ''))
             .filter(id => id);
         }
         
-        if (logChannel) {
-          botConfig.discord.logChannelId = logChannel.replace(/[<#>]/g, '');
-        }
+        // Update configuration
+        if (githubToken) botConfig.githubToken = githubToken;
+        if (discordToken) botConfig.discordToken = discordToken;
+        if (repoOwner) botConfig.repo.owner = repoOwner;
+        if (repoName) botConfig.repo.name = repoName;
+        if (workflowFile) botConfig.repo.workflowFile = workflowFile;
+        if (branch) botConfig.repo.branch = branch;
+        if (guildId) botConfig.guildId = guildId;
+        if (logChannelId) botConfig.discord.logChannelId = logChannelId;
+        if (allowedRoleIds.length > 0) botConfig.discord.allowedRoleIds = allowedRoleIds;
         
-        if (requirePermissions === 'true' || requirePermissions === 'false') {
-          botConfig.features.requirePermissions = requirePermissions === 'true';
-        }
-        
-        if (enableLogging === 'true' || enableLogging === 'false') {
-          botConfig.features.enableLogging = enableLogging === 'true';
-        }
-        
-        if (autoRefresh === 'true' || autoRefresh === 'false') {
-          botConfig.features.autoRefreshStatus = autoRefresh === 'true';
-        }
-        
-        if (refreshInterval) {
-          const interval = parseInt(refreshInterval);
-          if (!isNaN(interval) && interval >= 5000) {
-            botConfig.features.refreshInterval = interval;
-          }
-        }
+        botConfig.features.requirePermissions = requirePermissions;
+        botConfig.features.enableLogging = enableLogging;
+        botConfig.features.autoRefreshStatus = autoRefresh;
+        botConfig.features.refreshInterval = refreshInterval;
         
         // Save to database
         if (await saveAllConfigToDB()) {
@@ -1089,10 +1057,10 @@ client.on('interactionCreate', async (interaction) => {
             .setFooter({ text: '🗄️ Stored securely in PostgreSQL database' })
             .setTimestamp();
           
-          await interaction.editReply({ embeds: [embed], ephemeral: true });
+          await interaction.editReply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
           await sendLog(`⚙️ Configuration updated by ${interaction.user.tag}`, embed);
         } else {
-          await interaction.editReply({ content: '❌ Failed to save configuration', ephemeral: true });
+          await interaction.editReply({ content: '❌ Failed to save configuration', flags: [MessageFlags.Ephemeral] });
         }
       }
     }
@@ -1114,7 +1082,7 @@ client.on('interactionCreate', async (interaction) => {
 
       const handler = handlers[interaction.commandName];
       if (handler) await handler(interaction);
-      else await interaction.reply({ content: '❌ Unknown command', ephemeral: true });
+      else await interaction.reply({ content: '❌ Unknown command', flags: [MessageFlags.Ephemeral] });
     } else if (interaction.isButton()) {
       await handleButton(interaction);
     }
@@ -1123,7 +1091,7 @@ client.on('interactionCreate', async (interaction) => {
     const msg = '❌ Error occurred. Try again later.';
     try {
       if (interaction.deferred) await interaction.editReply(msg);
-      else if (!interaction.replied) await interaction.reply({ content: msg, ephemeral: true });
+      else if (!interaction.replied) await interaction.reply({ content: msg, flags: [MessageFlags.Ephemeral] });
     } catch (e) { log(`Error reply failed: ${e.message}`, 'ERROR'); }
   }
 });
