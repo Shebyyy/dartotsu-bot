@@ -23,19 +23,24 @@ if (typeof ReadableStream === 'undefined') {
 require('dotenv').config();
 const { Client, GatewayIntentBits, REST, Routes, EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { Octokit } = require('@octokit/rest');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const path = require('path');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN, request: { fetch: require('node-fetch') } });
 
 // ================================
-// DATABASE CONFIGURATION SYSTEM
+// POSTGRESQL DATABASE SYSTEM (RAILWAY READY)
 // ================================
-const DB_FILE = path.join(__dirname, 'bot.db');
 
-// Initialize database
-const db = new sqlite3.Database(DB_FILE);
+// Railway PostgreSQL connection with fallback for local development
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/botdb',
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  max: 20, // Maximum number of clients in the pool
+  idleTimeoutMillis: 30000, // How long a client is allowed to remain idle before being closed
+  connectionTimeoutMillis: 2000, // How long to wait when connecting a new client
+});
 
 // Configuration stored in database
 let botConfig = {
@@ -56,94 +61,96 @@ let botConfig = {
 };
 
 // Database functions
-const initDatabase = () => {
-  return new Promise((resolve, reject) => {
-    db.serialize(() => {
-      // Create config table
-      db.run(`CREATE TABLE IF NOT EXISTS config (
-        key TEXT PRIMARY KEY,
-        value TEXT
-      )`, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-  });
+const initDatabase = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS config (
+        key VARCHAR(50) PRIMARY KEY,
+        value TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Create trigger for updated_at
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION update_updated_at_column()
+      RETURNS TRIGGER AS $$       BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+      END;
+      $$ language 'plpgsql'
+    `);
+    
+    await pool.query(`
+      DROP TRIGGER IF EXISTS update_config_updated_at ON config
+    `);
+    
+    await pool.query(`
+      CREATE TRIGGER update_config_updated_at
+        BEFORE UPDATE ON config
+        FOR EACH ROW
+        EXECUTE FUNCTION update_updated_at_column()
+    `);
+    
+    log('PostgreSQL database initialized', 'INFO');
+  } catch (error) {
+    log(`Database init error: ${error.message}`, 'ERROR');
+  }
 };
 
 const loadConfigFromDB = async () => {
-  return new Promise((resolve, reject) => {
-    db.all("SELECT key, value FROM config", (err, rows) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      
-      // Load configuration from database
-      rows.forEach(row => {
-        switch(row.key) {
-          case 'githubToken':
-            botConfig.githubToken = row.value;
-            break;
-          case 'discordToken':
-            botConfig.discordToken = row.value;
-            break;
-          case 'guildId':
-            botConfig.guildId = row.value;
-            break;
-          case 'repoOwner':
-            botConfig.repo.owner = row.value;
-            break;
-          case 'repoName':
-            botConfig.repo.name = row.value;
-            break;
-          case 'workflowFile':
-            botConfig.repo.workflowFile = row.value;
-            break;
-          case 'branch':
-            botConfig.repo.branch = row.value;
-            break;
-          case 'allowedRoles':
+  try {
+    const { rows } = await pool.query("SELECT key, value FROM config");
+    
+    rows.forEach(row => {
+      switch(row.key) {
+        case 'githubToken': botConfig.githubToken = row.value; break;
+        case 'discordToken': botConfig.discordToken = row.value; break;
+        case 'guildId': botConfig.guildId = row.value; break;
+        case 'repoOwner': botConfig.repo.owner = row.value; break;
+        case 'repoName': botConfig.repo.name = row.value; break;
+        case 'workflowFile': botConfig.repo.workflowFile = row.value; break;
+        case 'branch': botConfig.repo.branch = row.value; break;
+        case 'allowedRoles': 
+          try {
             botConfig.discord.allowedRoleIds = row.value ? JSON.parse(row.value) : [];
-            break;
-          case 'logChannelId':
-            botConfig.discord.logChannelId = row.value;
-            break;
-          case 'requirePermissions':
-            botConfig.features.requirePermissions = row.value === 'true';
-            break;
-          case 'enableLogging':
-            botConfig.features.enableLogging = row.value === 'true';
-            break;
-          case 'autoRefreshStatus':
-            botConfig.features.autoRefreshStatus = row.value === 'true';
-            break;
-          case 'refreshInterval':
-            botConfig.features.refreshInterval = parseInt(row.value) || 30000;
-            break;
-        }
-      });
-      
-      resolve();
+          } catch (e) {
+            botConfig.discord.allowedRoleIds = [];
+            log(`Error parsing allowedRoles: ${e.message}`, 'ERROR');
+          }
+          break;
+        case 'logChannelId': botConfig.discord.logChannelId = row.value; break;
+        case 'requirePermissions': botConfig.features.requirePermissions = row.value === 'true'; break;
+        case 'enableLogging': botConfig.features.enableLogging = row.value === 'true'; break;
+        case 'autoRefreshStatus': botConfig.features.autoRefreshStatus = row.value === 'true'; break;
+        case 'refreshInterval': botConfig.features.refreshInterval = parseInt(row.value) || 30000; break;
+      }
     });
-  });
+    
+    log('Configuration loaded from PostgreSQL', 'INFO');
+  } catch (error) {
+    log(`Database load error: ${error.message}`, 'ERROR');
+  }
 };
 
 const saveConfigToDB = async (key, value) => {
-  return new Promise((resolve, reject) => {
-    db.run(
-      "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-      [key, value],
-      function(err) {
-        if (err) reject(err);
-        else resolve();
-      }
+  try {
+    await pool.query(
+      "INSERT INTO config (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP",
+      [key, value]
     );
-  });
+  } catch (error) {
+    log(`Save config error for ${key}: ${error.message}`, 'ERROR');
+    throw error;
+  }
 };
 
 const saveAllConfigToDB = async () => {
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+    
     await saveConfigToDB('githubToken', botConfig.githubToken || '');
     await saveConfigToDB('discordToken', botConfig.discordToken || '');
     await saveConfigToDB('guildId', botConfig.guildId || '');
@@ -158,24 +165,43 @@ const saveAllConfigToDB = async () => {
     await saveConfigToDB('autoRefreshStatus', botConfig.features.autoRefreshStatus.toString());
     await saveConfigToDB('refreshInterval', botConfig.features.refreshInterval.toString());
     
-    log('Configuration saved to database', 'INFO');
+    await client.query('COMMIT');
+    log('Configuration saved to PostgreSQL', 'INFO');
     return true;
   } catch (error) {
+    await client.query('ROLLBACK');
     log(`Failed to save configuration: ${error.message}`, 'ERROR');
     return false;
+  } finally {
+    client.release();
   }
 };
 
 const resetConfigInDB = async () => {
-  return new Promise((resolve, reject) => {
-    db.run("DELETE FROM config", (err) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
+  try {
+    await pool.query("DELETE FROM config");
+    log('PostgreSQL database cleared', 'INFO');
+  } catch (error) {
+    log(`Database reset error: ${error.message}`, 'ERROR');
+    throw error;
+  }
 };
 
 const getConfig = () => botConfig;
+
+// Test database connection
+const testDatabaseConnection = async () => {
+  try {
+    const client = await pool.connect();
+    await client.query('SELECT NOW()');
+    client.release();
+    log('PostgreSQL connection successful', 'INFO');
+    return true;
+  } catch (error) {
+    log(`Database connection failed: ${error.message}`, 'ERROR');
+    return false;
+  }
+};
 
 // ================================
 // CONSTANTS
@@ -788,6 +814,7 @@ const handleBotInfo = async (interaction) => {
       { name: '🔗 Version', value: '2.0.0', inline: true },
       { name: '📡 Ping', value: `${client.ws.ping}ms`, inline: true },
       { name: '🟢 Status', value: 'Online', inline: true },
+      { name: '🗄️ Database', value: 'PostgreSQL', inline: true },
       { name: '✨ Features', value: '• Buttons • Auto-refresh • Artifacts • Stats • Config', inline: false }
     )
     .setThumbnail(client.user.displayAvatarURL())
@@ -839,7 +866,7 @@ const handleConfig = async (interaction) => {
     const config = getConfig();
     const embed = new EmbedBuilder()
       .setColor(COLORS.info)
-      .setTitle('⚙️ Bot Configuration (Database Storage)')
+      .setTitle('⚙️ Bot Configuration (PostgreSQL Storage)')
       .addFields(
         { name: '📦 Repository', value: config.repo.owner && config.repo.name ? 
           `${config.repo.owner}/${config.repo.name}` : 'Not configured', inline: true },
@@ -855,7 +882,7 @@ const handleConfig = async (interaction) => {
         { name: '🔑 Tokens', value: config.githubToken && config.discordToken ? '✅ Set' : '❌ Missing', inline: true },
         { name: '🌐 Guild ID', value: config.guildId || 'Global commands', inline: true }
       )
-      .setFooter({ text: '🗄️ Stored in database - persists until reset' })
+      .setFooter({ text: '🗄️ Stored in PostgreSQL - persists until reset' })
       .setTimestamp();
     
     return await interaction.editReply({ embeds: [embed], ephemeral: true });
@@ -891,7 +918,7 @@ const handleConfig = async (interaction) => {
       .setColor(COLORS.success)
       .setTitle('🔄 Configuration Reset')
       .setDescription('Configuration has been reset to environment variables')
-      .setFooter({ text: 'Database cleared - all settings removed' })
+      .setFooter({ text: 'PostgreSQL database cleared - all settings removed' })
       .setTimestamp();
     
     await interaction.editReply({ embeds: [embed], ephemeral: true });
@@ -956,6 +983,13 @@ const handleButton = async (interaction) => {
 // EVENT HANDLERS
 // ================================
 client.once('ready', async () => {
+  // Test database connection first
+  const dbConnected = await testDatabaseConnection();
+  if (!dbConnected) {
+    log('❌ Failed to connect to database', 'ERROR');
+    return;
+  }
+  
   // Initialize and load database
   await initDatabase();
   await loadConfigFromDB();
@@ -1044,7 +1078,7 @@ client.on('interactionCreate', async (interaction) => {
           const embed = new EmbedBuilder()
             .setColor(COLORS.success)
             .setTitle('✅ Configuration Updated')
-            .setDescription('Your configuration has been saved to database!')
+            .setDescription('Your configuration has been saved to PostgreSQL!')
             .addFields(
               { name: '📦 Repository', value: botConfig.repo.owner && botConfig.repo.name ? 
                 `${botConfig.repo.owner}/${botConfig.repo.name}` : 'Not set', inline: true },
@@ -1052,7 +1086,7 @@ client.on('interactionCreate', async (interaction) => {
               { name: '🌿 Branch', value: botConfig.repo.branch || 'Not set', inline: true },
               { name: '🔑 Tokens', value: (botConfig.githubToken && botConfig.discordToken) ? '✅ Set' : '❌ Missing', inline: true }
             )
-            .setFooter({ text: '🗄️ Stored securely in database' })
+            .setFooter({ text: '🗄️ Stored securely in PostgreSQL database' })
             .setTimestamp();
           
           await interaction.editReply({ embeds: [embed], ephemeral: true });
@@ -1096,13 +1130,32 @@ client.on('interactionCreate', async (interaction) => {
 
 client.on('error', error => log(`Client error: ${error.message}`, 'ERROR'));
 process.on('unhandledRejection', error => log(`Unhandled rejection: ${error.message}`, 'ERROR'));
-process.on('SIGINT', () => { log('SIGINT - shutting down', 'INFO'); db.close(); client.destroy(); process.exit(0); });
-process.on('SIGTERM', () => { log('SIGTERM - shutting down', 'INFO'); db.close(); client.destroy(); process.exit(0); });
+process.on('SIGINT', async () => { 
+  log('SIGINT - shutting down', 'INFO'); 
+  await pool.end(); 
+  client.destroy(); 
+  process.exit(0); 
+});
+process.on('SIGTERM', async () => { 
+  log('SIGTERM - shutting down', 'INFO'); 
+  await pool.end(); 
+  client.destroy(); 
+  process.exit(0); 
+});
 
 // ================================
 // START BOT
 // ================================
 const startBot = async () => {
+  // Test database connection first
+  const dbConnected = await testDatabaseConnection();
+  if (!dbConnected) {
+    console.error('❌ Failed to connect to PostgreSQL database');
+    console.error('Please ensure DATABASE_URL is set correctly');
+    process.exit(1);
+  }
+  
+  // Initialize and load database
   await initDatabase();
   await loadConfigFromDB();
   const config = getConfig();
