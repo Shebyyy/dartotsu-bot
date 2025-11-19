@@ -1,5 +1,4 @@
 // Dartotsu Discord Bot
-// Repository: https://github.com/Shebyyy/Dartotsu
 
 // Polyfill ReadableStream
 if (typeof ReadableStream === 'undefined') {
@@ -27,7 +26,7 @@ const { Pool } = require('pg');
 const path = require('path');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN, request: { fetch: require('node-fetch') } });
+const octokit = new Octokit({ request: { fetch: require('node-fetch') } });
 
 // ================================
 // POSTGRESQL DATABASE SYSTEM (RAILWAY READY)
@@ -37,15 +36,14 @@ const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN, request: { fetch: 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/botdb',
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-  max: 20, // Maximum number of clients in pool
-  idleTimeoutMillis: 30000, // How long a client is allowed to remain idle before being closed
-  connectionTimeoutMillis: 2000, // How long to wait when connecting a new client
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
 // Configuration stored in database
 let botConfig = {
   githubToken: process.env.GITHUB_TOKEN || null,
-  discordToken: process.env.DISCORD_TOKEN || null,
   guildId: process.env.GUILD_ID || null,
   repo: { owner: null, name: null, workflowFile: null, branch: null },
   discord: {
@@ -72,7 +70,6 @@ const initDatabase = async () => {
       )
     `);
     
-    // Create trigger for updated_at
     await pool.query(`
       CREATE OR REPLACE FUNCTION update_updated_at_column()
       RETURNS TRIGGER AS $$       BEGIN
@@ -106,7 +103,6 @@ const loadConfigFromDB = async () => {
     rows.forEach(row => {
       switch(row.key) {
         case 'githubToken': botConfig.githubToken = row.value; break;
-        case 'discordToken': botConfig.discordToken = row.value; break;
         case 'guildId': botConfig.guildId = row.value; break;
         case 'repoOwner': botConfig.repo.owner = row.value; break;
         case 'repoName': botConfig.repo.name = row.value; break;
@@ -152,7 +148,6 @@ const saveAllConfigToDB = async () => {
     await client.query('BEGIN');
     
     await saveConfigToDB('githubToken', botConfig.githubToken || '');
-    await saveConfigToDB('discordToken', botConfig.discordToken || '');
     await saveConfigToDB('guildId', botConfig.guildId || '');
     await saveConfigToDB('repoOwner', botConfig.repo.owner || '');
     await saveConfigToDB('repoName', botConfig.repo.name || '');
@@ -189,7 +184,6 @@ const resetConfigInDB = async () => {
 
 const getConfig = () => botConfig;
 
-// Test database connection
 const testDatabaseConnection = async () => {
   try {
     const client = await pool.connect();
@@ -200,6 +194,15 @@ const testDatabaseConnection = async () => {
   } catch (error) {
     log(`Database connection failed: ${error.message}`, 'ERROR');
     return false;
+  }
+};
+
+const updateGitHubToken = () => {
+  if (botConfig.githubToken) {
+    octokit.auth = botConfig.githubToken;
+    log('GitHub token updated', 'INFO');
+  } else {
+    log('No GitHub token configured', 'WARN');
   }
 };
 
@@ -350,60 +353,60 @@ const createRunEmbed = (run, title = '📊 Workflow Status') => {
     .setTimestamp();
 };
 
-// Create configuration modal (FIXED - only 5 ActionRows)
+// Create a clean, organized configuration modal
 const createConfigModal = (currentConfig) => {
   const modal = new ModalBuilder()
     .setCustomId('configModal')
     .setTitle('🔧 Bot Configuration');
 
-  // Row 1: GitHub Token
+  // Row 1: GitHub Token (most important, separate)
   const githubToken = new TextInputBuilder()
     .setCustomId('githubToken')
-    .setLabel('GitHub Token (⚠️ Sensitive)')
+    .setLabel('🔑 GitHub Token')
     .setPlaceholder('ghp_xxxxxxxxxxxxxxxxxxxx')
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
     .setValue(currentConfig.githubToken || '');
 
-  // Row 2: Discord Token
-  const discordToken = new TextInputBuilder()
-    .setCustomId('discordToken')
-    .setLabel('Discord Bot Token (⚠️ Sensitive)')
-    .setPlaceholder('MTAxNzE5MjM4MzU2MjY3NjY4NA.G...')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.discordToken || '');
-
-  // Row 3: Repository Info (combined)
-  const repoInfo = new TextInputBuilder()
-    .setCustomId('repoInfo')
-    .setLabel('Repository (owner/name) and Workflow')
-    .setPlaceholder('Repository: owner/name\nWorkflow: dart.yml\nBranch: main')
+  // Row 2: Repository Details
+  const repoDetails = new TextInputBuilder()
+    .setCustomId('repoDetails')
+    .setLabel('📦 Repository Details')
+    .setPlaceholder('Owner: username\nName: repository\nBranch: main')
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
     .setValue(
-      `Repository: ${currentConfig.repo?.owner || ''}/${currentConfig.repo?.name || ''}\n` +
-      `Workflow: ${currentConfig.repo?.workflowFile || ''}\n` +
+      `Owner: ${currentConfig.repo?.owner || ''}\n` +
+      `Name: ${currentConfig.repo?.name || ''}\n` +
       `Branch: ${currentConfig.repo?.branch || ''}`
     );
 
-  // Row 4: Discord Settings (combined)
+  // Row 3: Workflow Details
+  const workflowDetails = new TextInputBuilder()
+    .setCustomId('workflowDetails')
+    .setLabel('🔧 Workflow Details')
+    .setPlaceholder('Workflow File: .github/workflows/build.yml')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.repo?.workflowFile || '');
+
+  // Row 4: Discord Settings
   const discordSettings = new TextInputBuilder()
     .setCustomId('discordSettings')
-    .setLabel('Discord Settings')
-    .setPlaceholder('Guild ID: 123456789012345678\nLog Channel: #bot-logs\nAllowed Roles: @Role1,@Role2 or 123,456')
+    .setLabel('💬 Discord Settings')
+    .setPlaceholder('Log Channel: #bot-logs\nAllowed Roles: @Role1, @Role2\nGuild ID: 123456789012345678')
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
     .setValue(
-      `Guild ID: ${currentConfig.guildId || ''}\n` +
       `Log Channel: ${currentConfig.discord?.logChannelId ? `#${currentConfig.discord.logChannelId}` : ''}\n` +
-      `Allowed Roles: ${currentConfig.discord?.allowedRoleIds?.map(id => `<@&${id}>`).join(',') || ''}`
+      `Allowed Roles: ${currentConfig.discord?.allowedRoleIds?.length > 0 ? currentConfig.discord.allowedRoleIds.map(id => `<@&${id}>`).join(', ') : ''}\n` +
+      `Guild ID: ${currentConfig.guildId || ''}`
     );
 
-  // Row 5: Feature Toggles (combined)
-  const features = new TextInputBuilder()
-    .setCustomId('features')
-    .setLabel('Features (true/false)')
+  // Row 5: Feature Toggles
+  const featureToggles = new TextInputBuilder()
+    .setCustomId('featureToggles')
+    .setLabel('⚙️ Feature Toggles')
     .setPlaceholder('Require Permissions: true\nEnable Logging: false\nAuto Refresh: true\nRefresh Interval: 30000')
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
@@ -414,16 +417,53 @@ const createConfigModal = (currentConfig) => {
       `Refresh Interval: ${currentConfig.features?.refreshInterval || 30000}`
     );
 
-  // Add only 5 rows (Discord limit)
+  // Add all 5 rows (Discord limit)
   modal.addComponents(
     new ActionRowBuilder().addComponents(githubToken),
-    new ActionRowBuilder().addComponents(discordToken),
-    new ActionRowBuilder().addComponents(repoInfo),
+    new ActionRowBuilder().addComponents(repoDetails),
+    new ActionRowBuilder().addComponents(workflowDetails),
     new ActionRowBuilder().addComponents(discordSettings),
-    new ActionRowBuilder().addComponents(features)
+    new ActionRowBuilder().addComponents(featureToggles)
   );
 
   return modal;
+};
+
+// GitHub API error handler
+const handleGitHubError = (error, interaction) => {
+  log(`GitHub API error: ${error.message}`, 'ERROR');
+  
+  let errorMessage = '❌ GitHub API Error';
+  let errorDetails = '';
+  
+  if (error.status === 401) {
+    errorMessage = '❌ Invalid GitHub Token';
+    errorDetails = 'The GitHub token you provided is invalid or has expired.\n\n**How to fix:**\n1. Go to GitHub Settings → Developer settings → Personal access tokens\n2. Generate a new token with `repo` and `workflow` scopes\n3. Use `/config action:configure` to update your token';
+  } else if (error.status === 403) {
+    errorMessage = '❌ GitHub Permission Denied';
+    errorDetails = 'The GitHub token doesn\'t have the required permissions or the repository is private.\n\n**How to fix:**\n1. Make sure the token has `repo` and `workflow` scopes\n2. If the repository is private, ensure the token has access to it';
+  } else if (error.status === 404) {
+    errorMessage = '❌ Repository or Workflow Not Found';
+    errorDetails = 'The repository, workflow file, or branch you specified doesn\'t exist.\n\n**How to fix:**\n1. Check that the repository name is correct\n2. Verify the workflow file exists in `.github/workflows/`\n3. Confirm the branch name is correct';
+  } else if (error.status === 422) {
+    errorMessage = '❌ Invalid Request';
+    errorDetails = 'The request to GitHub was invalid.\n\n**How to fix:**\n1. Check all input parameters\n2. Ensure the workflow file accepts the inputs you\'re providing';
+  } else if (error.status >= 500) {
+    errorMessage = '❌ GitHub Server Error';
+    errorDetails = 'GitHub is experiencing issues. Please try again later.';
+  }
+  
+  const errorEmbed = new EmbedBuilder()
+    .setColor(COLORS.failure)
+    .setTitle(errorMessage)
+    .setDescription(errorDetails)
+    .setTimestamp();
+  
+  if (interaction.replied || interaction.deferred) {
+    return interaction.editReply({ embeds: [errorEmbed] });
+  } else {
+    return interaction.reply({ embeds: [errorEmbed], flags: [MessageFlags.Ephemeral] });
+  }
 };
 
 // ================================
@@ -433,7 +473,13 @@ const handleBuild = async (interaction) => {
   await interaction.deferReply();
   const config = getConfig();
   
-  // Check if repository is configured
+  if (!config.githubToken) {
+    return await interaction.editReply({ 
+      content: '❌ GitHub Token not configured. Use `/config action:configure` to set it up', 
+      flags: [MessageFlags.Ephemeral] 
+    });
+  }
+  
   if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile || !config.repo.branch) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
@@ -475,17 +521,7 @@ const handleBuild = async (interaction) => {
     log(`Build: ${platform} by ${interaction.user.tag}`, 'INFO');
     await sendLog(`🚀 Build by ${interaction.user.tag}`, embed);
   } catch (error) {
-    log(`Build error: ${error.message}`, 'ERROR');
-    const errorEmbed = new EmbedBuilder()
-      .setColor(COLORS.failure)
-      .setTitle('❌ Build Failed')
-      .setDescription('Failed to trigger workflow')
-      .addFields(
-        { name: '🐛 Error', value: `\`\`\`${error.message}\`\`\`` },
-        { name: '💡 Causes', value: '• Invalid token\n• Workflow not found\n• Permissions\n• Rate limit' }
-      )
-      .setTimestamp();
-    await interaction.editReply({ embeds: [errorEmbed] });
+    return handleGitHubError(error, interaction);
   }
 };
 
@@ -493,7 +529,13 @@ const handleStatus = async (interaction) => {
   await interaction.deferReply();
   const config = getConfig();
   
-  // Check if repository is configured
+  if (!config.githubToken) {
+    return await interaction.editReply({ 
+      content: '❌ GitHub Token not configured. Use `/config action:configure` to set it up', 
+      flags: [MessageFlags.Ephemeral] 
+    });
+  }
+  
   if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
@@ -547,8 +589,7 @@ const handleStatus = async (interaction) => {
       }, config.features.refreshInterval);
     }
   } catch (error) {
-    log(`Status error: ${error.message}`, 'ERROR');
-    await interaction.editReply({ embeds: [new EmbedBuilder().setColor(COLORS.failure).setTitle('❌ Status Error').setDescription(error.message).setTimestamp()] });
+    return handleGitHubError(error, interaction);
   }
 };
 
@@ -556,7 +597,13 @@ const handleCancel = async (interaction) => {
   await interaction.deferReply();
   const config = getConfig();
   
-  // Check if repository is configured
+  if (!config.githubToken) {
+    return await interaction.editReply({ 
+      content: '❌ GitHub Token not configured. Use `/config action:configure` to set it up', 
+      flags: [MessageFlags.Ephemeral] 
+    });
+  }
+  
   if (!config.repo.owner || !config.repo.name) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
@@ -588,8 +635,7 @@ const handleCancel = async (interaction) => {
     await interaction.editReply({ embeds: [embed] });
     log(`Cancelled ${runId} by ${interaction.user.tag}`, 'INFO');
   } catch (error) {
-    log(`Cancel error: ${error.message}`, 'ERROR');
-    await interaction.editReply(`❌ Cancel failed: ${error.message}`);
+    return handleGitHubError(error, interaction);
   }
 };
 
@@ -597,7 +643,13 @@ const handleLogs = async (interaction) => {
   await interaction.deferReply();
   const config = getConfig();
   
-  // Check if repository is configured
+  if (!config.githubToken) {
+    return await interaction.editReply({ 
+      content: '❌ GitHub Token not configured. Use `/config action:configure` to set it up', 
+      flags: [MessageFlags.Ephemeral] 
+    });
+  }
+  
   if (!config.repo.owner || !config.repo.name) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
@@ -625,8 +677,7 @@ const handleLogs = async (interaction) => {
 
     await interaction.editReply({ embeds: [embed], components: [createButtons(run.id, run.html_url, false)] });
   } catch (error) {
-    log(`Logs error: ${error.message}`, 'ERROR');
-    await interaction.editReply(`❌ Logs failed: ${error.message}`);
+    return handleGitHubError(error, interaction);
   }
 };
 
@@ -634,7 +685,13 @@ const handleArtifacts = async (interaction) => {
   await interaction.deferReply();
   const config = getConfig();
   
-  // Check if repository is configured
+  if (!config.githubToken) {
+    return await interaction.editReply({ 
+      content: '❌ GitHub Token not configured. Use `/config action:configure` to set it up', 
+      flags: [MessageFlags.Ephemeral] 
+    });
+  }
+  
   if (!config.repo.owner || !config.repo.name) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
@@ -668,8 +725,7 @@ const handleArtifacts = async (interaction) => {
 
     await interaction.editReply({ embeds: [embed] });
   } catch (error) {
-    log(`Artifacts error: ${error.message}`, 'ERROR');
-    await interaction.editReply(`❌ Artifacts failed: ${error.message}`);
+    return handleGitHubError(error, interaction);
   }
 };
 
@@ -677,7 +733,13 @@ const handleHistory = async (interaction) => {
   await interaction.deferReply();
   const config = getConfig();
   
-  // Check if repository is configured
+  if (!config.githubToken) {
+    return await interaction.editReply({ 
+      content: '❌ GitHub Token not configured. Use `/config action:configure` to set it up', 
+      flags: [MessageFlags.Ephemeral] 
+    });
+  }
+  
   if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile) {
     return await interaction.editReply({ 
       content: '❌ Repository not configured. Use `/config action:configure` to set it up', 
@@ -732,8 +794,7 @@ const handleHistory = async (interaction) => {
 
     await interaction.editReply({ embeds: [embed] });
   } catch (error) {
-    log(`History error: ${error.message}`, 'ERROR');
-    await interaction.editReply(`❌ History failed: ${error.message}`);
+    return handleGitHubError(error, interaction);
   }
 };
 
@@ -822,7 +883,7 @@ const handleConfig = async (interaction) => {
         { name: '📢 Log Channel', value: config.discord.logChannelId ? `<#${config.discord.logChannelId}>` : 'None', inline: true },
         { name: '👥 Allowed Roles', value: config.discord.allowedRoleIds.length > 0 ? 
           config.discord.allowedRoleIds.map(id => `<@&${id}>`).join(', ') : 'None', inline: true },
-        { name: '🔑 Tokens', value: config.githubToken && config.discordToken ? '✅ Set' : '❌ Missing', inline: true },
+        { name: '🔑 GitHub Token', value: config.githubToken ? '✅ Set' : '❌ Missing', inline: true },
         { name: '🌐 Guild ID', value: config.guildId || 'Global commands', inline: true }
       )
       .setFooter({ text: '🗄️ Stored in PostgreSQL - persists until reset' })
@@ -837,12 +898,10 @@ const handleConfig = async (interaction) => {
   else if (action === 'reset') {
     await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
     
-    // Reset database and memory
     await resetConfigInDB();
     
     botConfig = {
       githubToken: process.env.GITHUB_TOKEN || null,
-      discordToken: process.env.DISCORD_TOKEN || null,
       guildId: process.env.GUILD_ID || null,
       repo: { owner: null, name: null, workflowFile: null, branch: null },
       discord: {
@@ -856,6 +915,8 @@ const handleConfig = async (interaction) => {
         refreshInterval: 30000
       }
     };
+    
+    updateGitHubToken();
     
     const embed = new EmbedBuilder()
       .setColor(COLORS.success)
@@ -885,8 +946,7 @@ const handleButton = async (interaction) => {
       await interaction.followUp({ content: '✅ Cancelled!', flags: [MessageFlags.Ephemeral] });
       log(`Button cancel ${runId} by ${interaction.user.tag}`, 'INFO');
     } catch (error) {
-      log(`Button cancel error: ${error.message}`, 'ERROR');
-      await interaction.followUp({ content: `❌ Failed: ${error.message}`, flags: [MessageFlags.Ephemeral] });
+      return handleGitHubError(error, interaction);
     }
   } else if (action === 'refresh') {
     await interaction.deferUpdate();
@@ -916,8 +976,7 @@ const handleButton = async (interaction) => {
         await interaction.followUp({ content: `${EMOJI.conclusion[run.conclusion] || '✅'} Build ${run.conclusion}!`, flags: [MessageFlags.Ephemeral] });
       }
     } catch (error) {
-      log(`Button refresh error: ${error.message}`, 'ERROR');
-      await interaction.followUp({ content: `❌ Failed: ${error.message}`, flags: [MessageFlags.Ephemeral] });
+      return handleGitHubError(error, interaction);
     }
   }
 };
@@ -926,16 +985,15 @@ const handleButton = async (interaction) => {
 // EVENT HANDLERS
 // ================================
 client.once('ready', async () => {
-  // Test database connection first
   const dbConnected = await testDatabaseConnection();
   if (!dbConnected) {
     log('❌ Failed to connect to database', 'ERROR');
     return;
   }
   
-  // Initialize and load database
   await initDatabase();
   await loadConfigFromDB();
+  updateGitHubToken();
   
   log(`✅ ${client.user.tag} ready`, 'INFO');
   client.user.setActivity('GitHub Actions 🚀', { type: 3 });
@@ -963,24 +1021,20 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.customId === 'configModal') {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
-        // Get combined field values
         const githubToken = interaction.fields.getTextInputValue('githubToken').trim();
-        const discordToken = interaction.fields.getTextInputValue('discordToken').trim();
-        const repoInfo = interaction.fields.getTextInputValue('repoInfo').trim();
+        const repoDetails = interaction.fields.getTextInputValue('repoDetails').trim();
+        const workflowDetails = interaction.fields.getTextInputValue('workflowDetails').trim();
         const discordSettings = interaction.fields.getTextInputValue('discordSettings').trim();
-        const features = interaction.fields.getTextInputValue('features').trim();
+        const featureToggles = interaction.fields.getTextInputValue('featureToggles').trim();
         
-        // Parse repository info
-        const repoLines = repoInfo.split('\n');
-        let repoOwner = '', repoName = '', workflowFile = '', branch = '';
+        // Parse repository details
+        const repoLines = repoDetails.split('\n');
+        let repoOwner = '', repoName = '', branch = '';
         repoLines.forEach(line => {
-          if (line.startsWith('Repository:')) {
-            const repo = line.replace('Repository:', '').trim();
-            if (repo.includes('/')) {
-              [repoOwner, repoName] = repo.split('/');
-            }
-          } else if (line.startsWith('Workflow:')) {
-            workflowFile = line.replace('Workflow:', '').trim();
+          if (line.startsWith('Owner:')) {
+            repoOwner = line.replace('Owner:', '').trim();
+          } else if (line.startsWith('Name:')) {
+            repoName = line.replace('Name:', '').trim();
           } else if (line.startsWith('Branch:')) {
             branch = line.replace('Branch:', '').trim();
           }
@@ -988,19 +1042,19 @@ client.on('interactionCreate', async (interaction) => {
         
         // Parse Discord settings
         const discordLines = discordSettings.split('\n');
-        let guildId = '', logChannelId = '', allowedRolesStr = '';
+        let logChannelId = '', allowedRolesStr = '', guildId = '';
         discordLines.forEach(line => {
-          if (line.startsWith('Guild ID:')) {
-            guildId = line.replace('Guild ID:', '').trim();
-          } else if (line.startsWith('Log Channel:')) {
+          if (line.startsWith('Log Channel:')) {
             logChannelId = line.replace('Log Channel:', '').trim().replace(/[<#>]/g, '');
           } else if (line.startsWith('Allowed Roles:')) {
             allowedRolesStr = line.replace('Allowed Roles:', '').trim();
+          } else if (line.startsWith('Guild ID:')) {
+            guildId = line.replace('Guild ID:', '').trim();
           }
         });
         
-        // Parse features
-        const featureLines = features.split('\n');
+        // Parse feature toggles
+        const featureLines = featureToggles.split('\n');
         let requirePermissions = false, enableLogging = false, autoRefresh = false, refreshInterval = 30000;
         featureLines.forEach(line => {
           if (line.startsWith('Require Permissions:')) {
@@ -1027,10 +1081,9 @@ client.on('interactionCreate', async (interaction) => {
         
         // Update configuration
         if (githubToken) botConfig.githubToken = githubToken;
-        if (discordToken) botConfig.discordToken = discordToken;
         if (repoOwner) botConfig.repo.owner = repoOwner;
         if (repoName) botConfig.repo.name = repoName;
-        if (workflowFile) botConfig.repo.workflowFile = workflowFile;
+        if (workflowDetails) botConfig.repo.workflowFile = workflowDetails;
         if (branch) botConfig.repo.branch = branch;
         if (guildId) botConfig.guildId = guildId;
         if (logChannelId) botConfig.discord.logChannelId = logChannelId;
@@ -1040,6 +1093,9 @@ client.on('interactionCreate', async (interaction) => {
         botConfig.features.enableLogging = enableLogging;
         botConfig.features.autoRefreshStatus = autoRefresh;
         botConfig.features.refreshInterval = refreshInterval;
+        
+        // Update GitHub token in Octokit
+        updateGitHubToken();
         
         // Save to database
         if (await saveAllConfigToDB()) {
@@ -1052,7 +1108,7 @@ client.on('interactionCreate', async (interaction) => {
                 `${botConfig.repo.owner}/${botConfig.repo.name}` : 'Not set', inline: true },
               { name: '🔧 Workflow', value: botConfig.repo.workflowFile || 'Not set', inline: true },
               { name: '🌿 Branch', value: botConfig.repo.branch || 'Not set', inline: true },
-              { name: '🔑 Tokens', value: (botConfig.githubToken && botConfig.discordToken) ? '✅ Set' : '❌ Missing', inline: true }
+              { name: '🔑 GitHub Token', value: botConfig.githubToken ? '✅ Set' : '❌ Missing', inline: true }
             )
             .setFooter({ text: '🗄️ Stored securely in PostgreSQL database' })
             .setTimestamp();
@@ -1065,7 +1121,6 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     else if (interaction.isChatInputCommand()) {
-      // Skip permission check for config command (Discord handles it)
       if (interaction.commandName !== 'config' && !await checkPermissions(interaction)) return;
 
       const handlers = {
@@ -1115,7 +1170,6 @@ process.on('SIGTERM', async () => {
 // START BOT
 // ================================
 const startBot = async () => {
-  // Test database connection first
   const dbConnected = await testDatabaseConnection();
   if (!dbConnected) {
     console.error('❌ Failed to connect to PostgreSQL database');
@@ -1123,30 +1177,26 @@ const startBot = async () => {
     process.exit(1);
   }
   
-  // Initialize and load database
   await initDatabase();
   await loadConfigFromDB();
-  const config = getConfig();
+  updateGitHubToken();
   
-  // Use config tokens or environment variables
-  const discordToken = config.discordToken || process.env.DISCORD_TOKEN;
-  const githubToken = config.githubToken || process.env.GITHUB_TOKEN;
-  
-  if (!discordToken) { 
-    console.error('❌ Discord Token not configured. Use /config action:configure to set it'); 
-    process.exit(1); 
-  }
-  if (!githubToken) { 
-    console.error('❌ GitHub Token not configured. Use /config action:configure to set it'); 
+  if (!process.env.DISCORD_TOKEN) { 
+    console.error('❌ Discord Token not configured. Please set DISCORD_TOKEN environment variable');
     process.exit(1); 
   }
   
-  // Update Octokit with token
-  octokit.auth = githubToken;
-  
-  client.login(discordToken)
-    .then(() => log('🚀 Login initiated', 'INFO'))
-    .catch(error => { log(`Login failed: ${error.message}`, 'ERROR'); process.exit(1); });
+  client.login(process.env.DISCORD_TOKEN)
+    .then(() => {
+      log('🚀 Bot started successfully', 'INFO');
+      if (!botConfig.githubToken) {
+        log('⚠️ GitHub token not set - use /config action:configure', 'WARN');
+      }
+    })
+    .catch(error => { 
+      log(`Login failed: ${error.message}`, 'ERROR'); 
+      process.exit(1); 
+    });
 };
 
 startBot();
