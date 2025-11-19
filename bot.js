@@ -353,77 +353,71 @@ const createRunEmbed = (run, title = '📊 Workflow Status') => {
     .setTimestamp();
 };
 
-// Create a clean, organized configuration modal with clear sections
+// Create a clean, organized configuration modal
 const createConfigModal = (currentConfig) => {
   const modal = new ModalBuilder()
     .setCustomId('configModal')
     .setTitle('🔧 Bot Configuration');
 
-  // Row 1: GitHub Token (separate for security)
+  // Row 1: GitHub Token (most important, separate)
   const githubToken = new TextInputBuilder()
     .setCustomId('githubToken')
     .setLabel('🔑 GitHub Token')
-    .setPlaceholder('Enter your GitHub personal access token')
+    .setPlaceholder('ghp_xxxxxxxxxxxxxxxxxxxx')
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
     .setValue(currentConfig.githubToken || '');
 
-  // Row 2: Repository Details (clean format)
+  // Row 2: Repository Details
   const repoDetails = new TextInputBuilder()
     .setCustomId('repoDetails')
-    .setLabel('📦 Repository')
-    .setPlaceholder('owner/repository-name (e.g., octocat/Hello-World)')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.repo.owner && currentConfig.repo.name ? `${currentConfig.repo.owner}/${currentConfig.repo.name}` : '');
-
-  // Row 3: Workflow & Branch
-  const workflowDetails = new TextInputBuilder()
-    .setCustomId('workflowDetails')
-    .setLabel('🔧 Workflow Configuration')
-    .setPlaceholder('workflow-file.yml (e.g., build.yml) | branch-name (e.g., main)')
-    .setStyle(TextInputStyle.Short)
+    .setLabel('📦 Repository Details')
+    .setPlaceholder('Owner: username\nName: repository\nBranch: main')
+    .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
     .setValue(
-      currentConfig.repo.workflowFile && currentConfig.repo.branch 
-        ? `${currentConfig.repo.workflowFile} | ${currentConfig.repo.branch}`
-        : ''
+      `Owner: ${currentConfig.repo?.owner || ''}\n` +
+      `Name: ${currentConfig.repo?.name || ''}\n` +
+      `Branch: ${currentConfig.repo?.branch || ''}`
     );
+
+  // Row 3: Workflow Details
+  const workflowDetails = new TextInputBuilder()
+    .setCustomId('workflowDetails')
+    .setLabel('🔧 Workflow Details')
+    .setPlaceholder('Workflow File: .github/workflows/build.yml')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(currentConfig.repo?.workflowFile || '');
 
   // Row 4: Discord Settings
   const discordSettings = new TextInputBuilder()
     .setCustomId('discordSettings')
     .setLabel('💬 Discord Settings')
-    .setPlaceholder('#channel-name | @role1 @role2 | guild-id (optional)')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(
-      [
-        currentConfig.discord.logChannelId ? `#${currentConfig.discord.logChannelId}` : '',
-        currentConfig.discord.allowedRoleIds.length > 0 
-          ? currentConfig.discord.allowedRoleIds.map(id => `<@&${id}>`).join(' ')
-          : '',
-        currentConfig.guildId || ''
-      ].filter(Boolean).join(' | ')
-    );
-
-  // Row 5: Feature Toggles (simple true/false)
-  const featureToggles = new TextInputBuilder()
-    .setCustomId('featureToggles')
-    .setLabel('⚙️ Features')
-    .setPlaceholder('require-permissions: true | enable-logging: false | auto-refresh: true')
+    .setPlaceholder('Log Channel: #bot-logs\nAllowed Roles: @Role1, @Role2\nGuild ID: 123456789012345678')
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(false)
     .setValue(
-      [
-        currentConfig.features.requirePermissions ? 'require-permissions: true' : 'require-permissions: false',
-        currentConfig.features.enableLogging ? 'enable-logging: true' : 'enable-logging: false',
-        currentConfig.features.autoRefreshStatus ? 'auto-refresh: true' : 'auto-refresh: false',
-        `refresh-interval: ${currentConfig.features.refreshInterval}`
-      ].join(' | ')
+      `Log Channel: ${currentConfig.discord?.logChannelId ? `#${currentConfig.discord.logChannelId}` : ''}\n` +
+      `Allowed Roles: ${currentConfig.discord?.allowedRoleIds?.length > 0 ? currentConfig.discord.allowedRoleIds.map(id => `<@&${id}>`).join(', ') : ''}\n` +
+      `Guild ID: ${currentConfig.guildId || ''}`
     );
 
-  // Add all 5 rows
+  // Row 5: Feature Toggles
+  const featureToggles = new TextInputBuilder()
+    .setCustomId('featureToggles')
+    .setLabel('⚙️ Feature Toggles')
+    .setPlaceholder('Require Permissions: true\nEnable Logging: false\nAuto Refresh: true\nRefresh Interval: 30000')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setValue(
+      `Require Permissions: ${currentConfig.features?.requirePermissions || false}\n` +
+      `Enable Logging: ${currentConfig.features?.enableLogging || false}\n` +
+      `Auto Refresh: ${currentConfig.features?.autoRefreshStatus || false}\n` +
+      `Refresh Interval: ${currentConfig.features?.refreshInterval || 30000}`
+    );
+
+  // Add all 5 rows (Discord limit)
   modal.addComponents(
     new ActionRowBuilder().addComponents(githubToken),
     new ActionRowBuilder().addComponents(repoDetails),
@@ -990,36 +984,18 @@ const handleButton = async (interaction) => {
 // ================================
 // EVENT HANDLERS
 // ================================
-let isReady = false;
-
 client.once('ready', async () => {
-  // Prevent multiple initializations
-  if (isReady) {
-    log('⚠️ Bot already initialized, skipping duplicate ready event', 'WARN');
-    return;
-  }
-  isReady = true;
-  
-  log('🔧 Bot starting up...', 'INFO');
-  log(`📊 Commands array length: ${commands.length}`, 'INFO');
-  log(`🔑 Discord Token: ${process.env.DISCORD_TOKEN ? 'Set' : 'Missing'}`, 'INFO');
-  log(`🗄️ Database URL: ${process.env.DATABASE_URL ? 'Set' : 'Missing'}`, 'INFO');
-  
-  // Test database connection first
   const dbConnected = await testDatabaseConnection();
   if (!dbConnected) {
     log('❌ Failed to connect to database', 'ERROR');
     return;
   }
   
-  // Initialize and load database
   await initDatabase();
   await loadConfigFromDB();
   updateGitHubToken();
   
   log(`✅ ${client.user.tag} ready`, 'INFO');
-  log(`🤖 Process ID: ${process.pid}`, 'INFO');
-  log(`🔗 Shard ID: ${client.shard?.ids?.join(', ') || 'None'}`, 'INFO');
   client.user.setActivity('GitHub Actions 🚀', { type: 3 });
   
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -1045,7 +1021,6 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.customId === 'configModal') {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
-        // Get all field values
         const githubToken = interaction.fields.getTextInputValue('githubToken').trim();
         const repoDetails = interaction.fields.getTextInputValue('repoDetails').trim();
         const workflowDetails = interaction.fields.getTextInputValue('workflowDetails').trim();
@@ -1053,46 +1028,71 @@ client.on('interactionCreate', async (interaction) => {
         const featureToggles = interaction.fields.getTextInputValue('featureToggles').trim();
         
         // Parse repository details
-        const [repoOwner, repoName] = repoDetails.includes('/') ? repoDetails.split('/') : [repoDetails, ''];
-        
-        // Parse workflow details
-        const [workflowFile, branch] = workflowDetails.includes('|') 
-          ? workflowDetails.split('|').map(s => s.trim())
-          : [workflowDetails.trim(), ''];
-        
-        // Parse Discord settings
-        const discordParts = discordSettings.split('|').map(s => s.trim());
-        const logChannelId = discordParts[0]?.replace(/[<#>]/g, '') || null;
-        const allowedRoles = discordParts[1]?.split(/[\s,]+/).map(s => s.replace(/[<@&>]/g, '')).filter(Boolean) || [];
-        const guildId = discordParts[2]?.trim() || null;
-        
-        // Parse feature toggles
-        const featureParts = featureToggles.split('|').map(s => s.trim());
-        const featureMap = {};
-        featureParts.forEach(part => {
-          const [key, value] = part.split(':').map(s => s.trim());
-          if (key && value) {
-            featureMap[key] = value.toLowerCase() === 'true';
+        const repoLines = repoDetails.split('\n');
+        let repoOwner = '', repoName = '', branch = '';
+        repoLines.forEach(line => {
+          if (line.startsWith('Owner:')) {
+            repoOwner = line.replace('Owner:', '').trim();
+          } else if (line.startsWith('Name:')) {
+            repoName = line.replace('Name:', '').trim();
+          } else if (line.startsWith('Branch:')) {
+            branch = line.replace('Branch:', '').trim();
           }
         });
         
-        // Parse refresh interval
-        const refreshInterval = featureMap['refresh-interval'] ? parseInt(featureMap['refresh-interval']) : 30000;
+        // Parse Discord settings
+        const discordLines = discordSettings.split('\n');
+        let logChannelId = '', allowedRolesStr = '', guildId = '';
+        discordLines.forEach(line => {
+          if (line.startsWith('Log Channel:')) {
+            logChannelId = line.replace('Log Channel:', '').trim().replace(/[<#>]/g, '');
+          } else if (line.startsWith('Allowed Roles:')) {
+            allowedRolesStr = line.replace('Allowed Roles:', '').trim();
+          } else if (line.startsWith('Guild ID:')) {
+            guildId = line.replace('Guild ID:', '').trim();
+          }
+        });
+        
+        // Parse feature toggles
+        const featureLines = featureToggles.split('\n');
+        let requirePermissions = false, enableLogging = false, autoRefresh = false, refreshInterval = 30000;
+        featureLines.forEach(line => {
+          if (line.startsWith('Require Permissions:')) {
+            requirePermissions = line.replace('Require Permissions:', '').trim().toLowerCase() === 'true';
+          } else if (line.startsWith('Enable Logging:')) {
+            enableLogging = line.replace('Enable Logging:', '').trim().toLowerCase() === 'true';
+          } else if (line.startsWith('Auto Refresh:')) {
+            autoRefresh = line.replace('Auto Refresh:', '').trim().toLowerCase() === 'true';
+          } else if (line.startsWith('Refresh Interval:')) {
+            const interval = parseInt(line.replace('Refresh Interval:', '').trim());
+            if (!isNaN(interval) && interval >= 5000) {
+              refreshInterval = interval;
+            }
+          }
+        });
+        
+        // Parse allowed roles
+        let allowedRoleIds = [];
+        if (allowedRolesStr) {
+          allowedRoleIds = allowedRolesStr.split(',')
+            .map(id => id.trim().replace(/[<@&>]/g, ''))
+            .filter(id => id);
+        }
         
         // Update configuration
         if (githubToken) botConfig.githubToken = githubToken;
         if (repoOwner) botConfig.repo.owner = repoOwner;
         if (repoName) botConfig.repo.name = repoName;
-        if (workflowFile) botConfig.repo.workflowFile = workflowFile;
+        if (workflowDetails) botConfig.repo.workflowFile = workflowDetails;
         if (branch) botConfig.repo.branch = branch;
-        if (logChannelId) botConfig.discord.logChannelId = logChannelId;
-        if (allowedRoles.length > 0) botConfig.discord.allowedRoleIds = allowedRoles;
         if (guildId) botConfig.guildId = guildId;
+        if (logChannelId) botConfig.discord.logChannelId = logChannelId;
+        if (allowedRoleIds.length > 0) botConfig.discord.allowedRoleIds = allowedRoleIds;
         
-        botConfig.features.requirePermissions = featureMap['require-permissions'] || false;
-        botConfig.features.enableLogging = featureMap['enable-logging'] || false;
-        botConfig.features.autoRefreshStatus = featureMap['auto-refresh'] || false;
-        botConfig.features.refreshInterval = refreshInterval || 30000;
+        botConfig.features.requirePermissions = requirePermissions;
+        botConfig.features.enableLogging = enableLogging;
+        botConfig.features.autoRefreshStatus = autoRefresh;
+        botConfig.features.refreshInterval = refreshInterval;
         
         // Update GitHub token in Octokit
         updateGitHubToken();
@@ -1108,10 +1108,7 @@ client.on('interactionCreate', async (interaction) => {
                 `${botConfig.repo.owner}/${botConfig.repo.name}` : 'Not set', inline: true },
               { name: '🔧 Workflow', value: botConfig.repo.workflowFile || 'Not set', inline: true },
               { name: '🌿 Branch', value: botConfig.repo.branch || 'Not set', inline: true },
-              { name: '🔑 GitHub Token', value: botConfig.githubToken ? '✅ Set' : '❌ Missing', inline: true },
-              { name: '📢 Log Channel', value: botConfig.discord.logChannelId ? `<#${botConfig.discord.logChannelId}>` : 'None', inline: true },
-              { name: '👥 Allowed Roles', value: botConfig.discord.allowedRoleIds.length > 0 ? 
-                `${botConfig.discord.allowedRoleIds.length} roles` : 'None', inline: true }
+              { name: '🔑 GitHub Token', value: botConfig.githubToken ? '✅ Set' : '❌ Missing', inline: true }
             )
             .setFooter({ text: '🗄️ Stored securely in PostgreSQL database' })
             .setTimestamp();
@@ -1122,7 +1119,6 @@ client.on('interactionCreate', async (interaction) => {
           await interaction.editReply({ content: '❌ Failed to save configuration', flags: [MessageFlags.Ephemeral] });
         }
       }
-    }
     }
     else if (interaction.isChatInputCommand()) {
       if (interaction.commandName !== 'config' && !await checkPermissions(interaction)) return;
@@ -1174,12 +1170,6 @@ process.on('SIGTERM', async () => {
 // START BOT
 // ================================
 const startBot = async () => {
-  log('🔧 Bot starting up...', 'INFO');
-  log(`📊 Commands array length: ${commands.length}`, 'INFO');
-  log(`🔑 Discord Token: ${process.env.DISCORD_TOKEN ? 'Set' : 'Missing'}`, 'INFO');
-  log(`🗄️ Database URL: ${process.env.DATABASE_URL ? 'Set' : 'Missing'}`, 'INFO');
-  
-  // Test database connection first
   const dbConnected = await testDatabaseConnection();
   if (!dbConnected) {
     console.error('❌ Failed to connect to PostgreSQL database');
@@ -1187,7 +1177,6 @@ const startBot = async () => {
     process.exit(1);
   }
   
-  // Initialize and load database
   await initDatabase();
   await loadConfigFromDB();
   updateGitHubToken();
