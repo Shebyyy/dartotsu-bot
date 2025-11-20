@@ -554,6 +554,24 @@ const commands = [
         { name: '🔄 Reset All', value: 'reset' }
       ]}
     ]
+  },
+  {
+    name: 'cleanup-commands',
+    description: 'Clean up duplicate bot commands (Admin only)',
+    default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+    options: [
+      {
+        name: 'type',
+        description: 'Type of commands to clean',
+        type: 3,
+        required: true,
+        choices: [
+          { name: '🌐 Global Commands', value: 'global' },
+          { name: '🏠 Guild Commands', value: 'guild' },
+          { name: '🧹 All Commands', value: 'all' }
+        ]
+      }
+    ]
   }
 ];
 
@@ -646,6 +664,38 @@ const createRunEmbed = (run, title = '📊 Workflow Status') => {
       { name: '🆔 ID', value: `\`${run.id}\``, inline: true }
     )
     .setTimestamp();
+};
+
+// Clean up duplicate commands
+const cleanupCommands = async () => {
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  const config = getConfig();
+  
+  try {
+    log('🧹 Cleaning up existing commands...', 'INFO');
+    
+    // If guild ID is set, remove global commands
+    if (config.guildId) {
+      const existingCommands = await rest.get(Routes.applicationCommands(client.user.id));
+      if (existingCommands.length > 0) {
+        await rest.put(Routes.applicationCommands(client.user.id), { body: [] });
+        log(`✅ Removed ${existingCommands.length} global commands`, 'INFO');
+      }
+    }
+    // If no guild ID, remove all guild commands
+    else {
+      const guilds = client.guilds.cache;
+      for (const [guildId] of guilds) {
+        const existingCommands = await rest.get(Routes.applicationGuildCommands(client.user.id, guildId));
+        if (existingCommands.length > 0) {
+          await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: [] });
+          log(`✅ Removed ${existingCommands.length} guild commands from ${guildId}`, 'INFO');
+        }
+      }
+    }
+  } catch (error) {
+    log(`❌ Command cleanup error: ${error.message}`, 'ERROR');
+  }
 };
 
 const handleGitHubError = (error, interaction) => {
@@ -1072,7 +1122,8 @@ const handleHelp = async (interaction) => {
       { name: '📦 /list-artifacts', value: '`/list-artifacts`\nList build files', inline: false },
       { name: '📈 /workflow-history', value: '`/workflow-history days:30`\nView stats', inline: false },
       { name: '🤖 /bot-info', value: 'Bot information', inline: false },
-      { name: '⚙️ /config', value: '`/config action:configure`\nMulti-page setup (Admin only)', inline: false }
+      { name: '⚙️ /config', value: '`/config action:configure`\nMulti-page setup (Admin only)', inline: false },
+      { name: '🧹 /cleanup-commands', value: '`/cleanup-commands type:all`\nRemove duplicate commands', inline: false }
     )
     .setFooter({ text: 'Most params are optional!' })
     .setTimestamp();
@@ -1155,6 +1206,53 @@ const handleConfig = async (interaction) => {
     
     await interaction.editReply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
     await sendLog(`🔄 Configuration reset by ${interaction.user.tag}`, embed);
+  }
+};
+
+const handleCleanup = async (interaction) => {
+  await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+  
+  const type = interaction.options.getString('type');
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  
+  try {
+    let removed = 0;
+    
+    if (type === 'global' || type === 'all') {
+      const existingCommands = await rest.get(Routes.applicationCommands(client.user.id));
+      if (existingCommands.length > 0) {
+        await rest.put(Routes.applicationCommands(client.user.id), { body: [] });
+        removed += existingCommands.length;
+        log(`✅ Removed ${existingCommands.length} global commands`, 'INFO');
+      }
+    }
+    
+    if (type === 'guild' || type === 'all') {
+      const guilds = client.guilds.cache;
+      for (const [guildId] of guilds) {
+        const existingCommands = await rest.get(Routes.applicationGuildCommands(client.user.id, guildId));
+        if (existingCommands.length > 0) {
+          await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: [] });
+          removed += existingCommands.length;
+        }
+      }
+      log(`✅ Removed guild commands from ${guilds.size} servers`, 'INFO');
+    }
+    
+    const embed = new EmbedBuilder()
+      .setColor(COLORS.success)
+      .setTitle('🧹 Commands Cleaned Up')
+      .setDescription(`Successfully removed ${removed} duplicate commands`)
+      .addFields(
+        { name: '🔄 Next Step', value: 'Restart the bot to re-register commands properly', inline: false },
+        { name: '💡 Tip', value: 'Use /config to set either a guild ID (for guild commands) or leave empty (for global commands)', inline: false }
+      )
+      .setTimestamp();
+    
+    await interaction.editReply({ embeds: [embed] });
+  } catch (error) {
+    log(`Cleanup error: ${error.message}`, 'ERROR');
+    await interaction.editReply({ content: `❌ Error: ${error.message}`, flags: [MessageFlags.Ephemeral] });
   }
 };
 
@@ -1310,6 +1408,9 @@ client.once('ready', async () => {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   
   try {
+    // Clean up existing commands first
+    await cleanupCommands();
+    
     log('🔄 Registering commands...', 'INFO');
     const config = getConfig();
     const route = config.guildId 
@@ -1349,7 +1450,7 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     else if (interaction.isChatInputCommand()) {
-      if (interaction.commandName !== 'config' && !await checkPermissions(interaction)) return;
+      if (interaction.commandName !== 'config' && interaction.commandName !== 'cleanup-commands' && !await checkPermissions(interaction)) return;
 
       const handlers = {
         'build': handleBuild,
@@ -1360,7 +1461,8 @@ client.on('interactionCreate', async (interaction) => {
         'workflow-history': handleHistory,
         'bot-info': handleBotInfo,
         'help': handleHelp,
-        'config': handleConfig
+        'config': handleConfig,
+        'cleanup-commands': handleCleanup
       };
 
       const handler = handlers[interaction.commandName];
