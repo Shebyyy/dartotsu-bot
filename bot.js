@@ -3,10 +3,11 @@
 // Polyfill ReadableStream
 if (typeof ReadableStream === 'undefined') {
   try {
-    ReadableStream = require('stream/web').ReadableStream;
+    const streamWeb = require('stream/web');
+    ReadableStream = streamWeb.ReadableStream;
   } catch (e) {
     const { Readable } = require('stream');
-    ReadableStream = class extends Readable {
+    global.ReadableStream = class extends Readable {
       constructor(options = {}) {
         super(options);
         this._controller = {
@@ -14,6 +15,7 @@ if (typeof ReadableStream === 'undefined') {
           close: () => this.push(null),
           error: (e) => this.destroy(e)
         };
+        if (options.start) options.start(this._controller);
       }
     };
   }
@@ -32,7 +34,6 @@ const octokit = new Octokit({ request: { fetch: require('node-fetch') } });
 // POSTGRESQL DATABASE SYSTEM (RAILWAY READY)
 // ================================
 
-// Railway PostgreSQL connection with fallback for local development
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/botdb',
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
@@ -41,7 +42,6 @@ const pool = new Pool({
   connectionTimeoutMillis: 2000,
 });
 
-// Configuration stored in database
 let botConfig = {
   githubToken: process.env.GITHUB_TOKEN || null,
   guildId: process.env.GUILD_ID || null,
@@ -218,6 +218,301 @@ const EMOJI = {
 const COLORS = { success: 0x00FF00, failure: 0xFF0000, cancelled: 0xFFA500, in_progress: 0xFFFF00, queued: 0x808080, info: 0x5865F2 };
 
 // ================================
+// MULTI-PAGE CONFIGURATION SYSTEM
+// ================================
+
+// Store temporary config data during multi-page setup
+const configSessions = new Map();
+
+// Create configuration page with navigation buttons
+const createConfigPage = (page, userId) => {
+  const session = configSessions.get(userId) || { ...botConfig, page: 1 };
+  
+  const pages = {
+    1: { // GitHub Settings
+      title: '🔑 GitHub Configuration (Page 1/3)',
+      fields: [
+        {
+          id: 'githubToken',
+          label: '🔑 GitHub Personal Access Token',
+          placeholder: 'ghp_xxxxxxxxxxxxxxxxxxxx',
+          style: TextInputStyle.Short,
+          required: false,
+          value: session.githubToken || ''
+        },
+        {
+          id: 'repoOwner',
+          label: '👤 Repository Owner',
+          placeholder: 'username or organization',
+          style: TextInputStyle.Short,
+          required: false,
+          value: session.repo?.owner || ''
+        },
+        {
+          id: 'repoName',
+          label: '📦 Repository Name',
+          placeholder: 'repository-name',
+          style: TextInputStyle.Short,
+          required: false,
+          value: session.repo?.name || ''
+        },
+        {
+          id: 'workflowFile',
+          label: '🔧 Workflow File Path',
+          placeholder: '.github/workflows/build.yml',
+          style: TextInputStyle.Short,
+          required: false,
+          value: session.repo?.workflowFile || ''
+        },
+        {
+          id: 'branch',
+          label: '🌿 Default Branch',
+          placeholder: 'main or master',
+          style: TextInputStyle.Short,
+          required: false,
+          value: session.repo?.branch || ''
+        }
+      ]
+    },
+    2: { // Discord Settings
+      title: '💬 Discord Configuration (Page 2/3)',
+      fields: [
+        {
+          id: 'guildId',
+          label: '🌐 Guild ID (Leave empty for global)',
+          placeholder: '123456789012345678',
+          style: TextInputStyle.Short,
+          required: false,
+          value: session.guildId || ''
+        },
+        {
+          id: 'logChannelId',
+          label: '📢 Log Channel ID',
+          placeholder: '123456789012345678',
+          style: TextInputStyle.Short,
+          required: false,
+          value: session.discord?.logChannelId || ''
+        },
+        {
+          id: 'allowedRoleIds',
+          label: '👥 Allowed Role IDs (comma-separated)',
+          placeholder: '123456789012345678, 987654321098765432',
+          style: TextInputStyle.Paragraph,
+          required: false,
+          value: session.discord?.allowedRoleIds?.join(', ') || ''
+        }
+      ]
+    },
+    3: { // Feature Settings
+      title: '⚙️ Feature Configuration (Page 3/3)',
+      fields: [
+        {
+          id: 'requirePermissions',
+          label: '🔐 Require Role Permissions',
+          placeholder: 'true or false',
+          style: TextInputStyle.Short,
+          required: false,
+          value: (session.features?.requirePermissions || false).toString()
+        },
+        {
+          id: 'enableLogging',
+          label: '📝 Enable File Logging',
+          placeholder: 'true or false',
+          style: TextInputStyle.Short,
+          required: false,
+          value: (session.features?.enableLogging || false).toString()
+        },
+        {
+          id: 'autoRefreshStatus',
+          label: '🔄 Auto-Refresh Workflow Status',
+          placeholder: 'true or false',
+          style: TextInputStyle.Short,
+          required: false,
+          value: (session.features?.autoRefreshStatus || false).toString()
+        },
+        {
+          id: 'refreshInterval',
+          label: '⏱️ Refresh Interval (milliseconds)',
+          placeholder: '30000 (minimum: 5000)',
+          style: TextInputStyle.Short,
+          required: false,
+          value: (session.features?.refreshInterval || 30000).toString()
+        }
+      ]
+    }
+  };
+  
+  const pageData = pages[page];
+  if (!pageData) return null;
+  
+  const modal = new ModalBuilder()
+    .setCustomId(`configModal_${page}`)
+    .setTitle(pageData.title);
+  
+  pageData.fields.forEach(field => {
+    const input = new TextInputBuilder()
+      .setCustomId(field.id)
+      .setLabel(field.label)
+      .setPlaceholder(field.placeholder)
+      .setStyle(field.style)
+      .setRequired(field.required)
+      .setValue(field.value);
+    
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+  });
+  
+  return modal;
+};
+
+// Create navigation buttons for config pages
+const createConfigNavigation = (currentPage, userId) => {
+  const row = new ActionRowBuilder();
+  
+  if (currentPage > 1) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`config_prev_${userId}`)
+        .setLabel('◀️ Previous')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  
+  if (currentPage < 3) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`config_next_${userId}`)
+        .setLabel('Next ▶️')
+        .setStyle(ButtonStyle.Primary)
+    );
+  }
+  
+  if (currentPage === 3) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`config_save_${userId}`)
+        .setLabel('💾 Save Configuration')
+        .setStyle(ButtonStyle.Success)
+    );
+  }
+  
+  row.addComponents(
+    new ButtonBuilder()
+      .setCustomId(`config_cancel_${userId}`)
+      .setLabel('❌ Cancel')
+      .setStyle(ButtonStyle.Danger)
+  );
+  
+  return row;
+};
+
+// Create config overview embed
+const createConfigOverview = (page, userId) => {
+  const session = configSessions.get(userId) || botConfig;
+  
+  const pageDescriptions = {
+    1: '**GitHub Settings** - Configure your GitHub repository and authentication',
+    2: '**Discord Settings** - Set up Discord channels and permissions',
+    3: '**Feature Settings** - Toggle bot features and behavior'
+  };
+  
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.info)
+    .setTitle(`⚙️ Bot Configuration Setup (Page ${page}/3)`)
+    .setDescription(pageDescriptions[page])
+    .setFooter({ text: 'Click buttons below to navigate or save' })
+    .setTimestamp();
+  
+  // Add current page fields as preview
+  if (page === 1) {
+    embed.addFields(
+      { name: '🔑 GitHub Token', value: session.githubToken ? '✅ Set' : '❌ Not set', inline: true },
+      { name: '📦 Repository', value: session.repo?.owner && session.repo?.name ? 
+        `${session.repo.owner}/${session.repo.name}` : '❌ Not set', inline: true },
+      { name: '🌿 Branch', value: session.repo?.branch || '❌ Not set', inline: true }
+    );
+  } else if (page === 2) {
+    embed.addFields(
+      { name: '🌐 Guild ID', value: session.guildId || 'Global commands', inline: true },
+      { name: '📢 Log Channel', value: session.discord?.logChannelId ? 
+        `<#${session.discord.logChannelId}>` : '❌ Not set', inline: true },
+      { name: '👥 Allowed Roles', value: session.discord?.allowedRoleIds?.length > 0 ? 
+        `${session.discord.allowedRoleIds.length} role(s)` : '❌ None', inline: true }
+    );
+  } else if (page === 3) {
+    embed.addFields(
+      { name: '🔐 Require Permissions', value: session.features?.requirePermissions ? '✅ Yes' : '❌ No', inline: true },
+      { name: '📝 File Logging', value: session.features?.enableLogging ? '✅ Enabled' : '❌ Disabled', inline: true },
+      { name: '🔄 Auto-Refresh', value: session.features?.autoRefreshStatus ? '✅ Enabled' : '❌ Disabled', inline: true }
+    );
+  }
+  
+  return embed;
+};
+
+// Parse and validate modal input
+const parseModalInput = (interaction, page) => {
+  const userId = interaction.user.id;
+  const session = configSessions.get(userId) || { ...botConfig, page: 1 };
+  
+  try {
+    if (page === 1) {
+      // GitHub Settings
+      const token = interaction.fields.getTextInputValue('githubToken').trim();
+      const owner = interaction.fields.getTextInputValue('repoOwner').trim();
+      const name = interaction.fields.getTextInputValue('repoName').trim();
+      const workflow = interaction.fields.getTextInputValue('workflowFile').trim();
+      const branch = interaction.fields.getTextInputValue('branch').trim();
+      
+      if (token) session.githubToken = token;
+      if (owner) session.repo.owner = owner;
+      if (name) session.repo.name = name;
+      if (workflow) session.repo.workflowFile = workflow;
+      if (branch) session.repo.branch = branch;
+      
+    } else if (page === 2) {
+      // Discord Settings
+      const guildId = interaction.fields.getTextInputValue('guildId').trim();
+      const logChannel = interaction.fields.getTextInputValue('logChannelId').trim();
+      const rolesInput = interaction.fields.getTextInputValue('allowedRoleIds').trim();
+      
+      if (guildId) session.guildId = guildId;
+      if (logChannel) session.discord.logChannelId = logChannel;
+      
+      if (rolesInput) {
+        const roleIds = rolesInput.split(',')
+          .map(id => id.trim())
+          .filter(id => id && /^\d+$/.test(id));
+        session.discord.allowedRoleIds = roleIds;
+      }
+      
+    } else if (page === 3) {
+      // Feature Settings
+      const requirePerms = interaction.fields.getTextInputValue('requirePermissions').trim().toLowerCase();
+      const enableLog = interaction.fields.getTextInputValue('enableLogging').trim().toLowerCase();
+      const autoRefresh = interaction.fields.getTextInputValue('autoRefreshStatus').trim().toLowerCase();
+      const interval = interaction.fields.getTextInputValue('refreshInterval').trim();
+      
+      session.features.requirePermissions = requirePerms === 'true';
+      session.features.enableLogging = enableLog === 'true';
+      session.features.autoRefreshStatus = autoRefresh === 'true';
+      
+      const parsedInterval = parseInt(interval);
+      if (!isNaN(parsedInterval) && parsedInterval >= 5000) {
+        session.features.refreshInterval = parsedInterval;
+      }
+    }
+    
+    session.page = page;
+    configSessions.set(userId, session);
+    return { success: true, session };
+    
+  } catch (error) {
+    log(`Parse modal error: ${error.message}`, 'ERROR');
+    return { success: false, error: error.message };
+  }
+};
+
+// ================================
 // COMMANDS
 // ================================
 const commands = [
@@ -353,83 +648,6 @@ const createRunEmbed = (run, title = '📊 Workflow Status') => {
     .setTimestamp();
 };
 
-// Create a clean, organized configuration modal
-const createConfigModal = (currentConfig) => {
-  const modal = new ModalBuilder()
-    .setCustomId('configModal')
-    .setTitle('🔧 Bot Configuration');
-
-  // Row 1: GitHub Token (most important, separate)
-  const githubToken = new TextInputBuilder()
-    .setCustomId('githubToken')
-    .setLabel('🔑 GitHub Token')
-    .setPlaceholder('ghp_xxxxxxxxxxxxxxxxxxxx')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.githubToken || '');
-
-  // Row 2: Repository Details
-  const repoDetails = new TextInputBuilder()
-    .setCustomId('repoDetails')
-    .setLabel('📦 Repository Details')
-    .setPlaceholder('Owner: username\nName: repository\nBranch: main')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setValue(
-      `Owner: ${currentConfig.repo?.owner || ''}\n` +
-      `Name: ${currentConfig.repo?.name || ''}\n` +
-      `Branch: ${currentConfig.repo?.branch || ''}`
-    );
-
-  // Row 3: Workflow Details
-  const workflowDetails = new TextInputBuilder()
-    .setCustomId('workflowDetails')
-    .setLabel('🔧 Workflow Details')
-    .setPlaceholder('Workflow File: .github/workflows/build.yml')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(currentConfig.repo?.workflowFile || '');
-
-  // Row 4: Discord Settings
-  const discordSettings = new TextInputBuilder()
-    .setCustomId('discordSettings')
-    .setLabel('💬 Discord Settings')
-    .setPlaceholder('Log Channel: #bot-logs\nAllowed Roles: @Role1, @Role2\nGuild ID: 123456789012345678')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setValue(
-      `Log Channel: ${currentConfig.discord?.logChannelId ? `#${currentConfig.discord.logChannelId}` : ''}\n` +
-      `Allowed Roles: ${currentConfig.discord?.allowedRoleIds?.length > 0 ? currentConfig.discord.allowedRoleIds.map(id => `<@&${id}>`).join(', ') : ''}\n` +
-      `Guild ID: ${currentConfig.guildId || ''}`
-    );
-
-  // Row 5: Feature Toggles
-  const featureToggles = new TextInputBuilder()
-    .setCustomId('featureToggles')
-    .setLabel('⚙️ Feature Toggles')
-    .setPlaceholder('Require Permissions: true\nEnable Logging: false\nAuto Refresh: true\nRefresh Interval: 30000')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setValue(
-      `Require Permissions: ${currentConfig.features?.requirePermissions || false}\n` +
-      `Enable Logging: ${currentConfig.features?.enableLogging || false}\n` +
-      `Auto Refresh: ${currentConfig.features?.autoRefreshStatus || false}\n` +
-      `Refresh Interval: ${currentConfig.features?.refreshInterval || 30000}`
-    );
-
-  // Add all 5 rows (Discord limit)
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(githubToken),
-    new ActionRowBuilder().addComponents(repoDetails),
-    new ActionRowBuilder().addComponents(workflowDetails),
-    new ActionRowBuilder().addComponents(discordSettings),
-    new ActionRowBuilder().addComponents(featureToggles)
-  );
-
-  return modal;
-};
-
-// GitHub API error handler
 const handleGitHubError = (error, interaction) => {
   log(`GitHub API error: ${error.message}`, 'ERROR');
   
@@ -815,11 +1033,11 @@ const handleBotInfo = async (interaction) => {
       { name: '🌐 Servers', value: `${client.guilds.cache.size}`, inline: true },
       { name: '📊 Commands', value: `${commands.length}`, inline: true },
       { name: '💾 Memory', value: memory, inline: true },
-      { name: '🔗 Version', value: '2.0.0', inline: true },
+      { name: '🔗 Version', value: '3.0.0', inline: true },
       { name: '📡 Ping', value: `${client.ws.ping}ms`, inline: true },
       { name: '🟢 Status', value: 'Online', inline: true },
       { name: '🗄️ Database', value: 'PostgreSQL', inline: true },
-      { name: '✨ Features', value: '• Buttons • Auto-refresh • Artifacts • Stats • Config', inline: false }
+      { name: '✨ Features', value: '• Multi-page Config • Buttons • Auto-refresh • Artifacts • Stats', inline: false }
     )
     .setThumbnail(client.user.displayAvatarURL())
     .setFooter({ text: interaction.user.tag, iconURL: interaction.user.displayAvatarURL() })
@@ -854,7 +1072,7 @@ const handleHelp = async (interaction) => {
       { name: '📦 /list-artifacts', value: '`/list-artifacts`\nList build files', inline: false },
       { name: '📈 /workflow-history', value: '`/workflow-history days:30`\nView stats', inline: false },
       { name: '🤖 /bot-info', value: 'Bot information', inline: false },
-      { name: '⚙️ /config', value: '`/config action:configure`\nManage bot settings (Admin only)', inline: false }
+      { name: '⚙️ /config', value: '`/config action:configure`\nMulti-page setup (Admin only)', inline: false }
     )
     .setFooter({ text: 'Most params are optional!' })
     .setTimestamp();
@@ -892,8 +1110,18 @@ const handleConfig = async (interaction) => {
     return await interaction.editReply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
   } 
   else if (action === 'configure') {
-    const modal = createConfigModal(getConfig());
-    await interaction.showModal(modal);
+    // Start multi-page configuration
+    const userId = interaction.user.id;
+    configSessions.set(userId, { ...botConfig, page: 1 });
+    
+    const embed = createConfigOverview(1, userId);
+    const navigation = createConfigNavigation(1, userId);
+    
+    await interaction.reply({ 
+      embeds: [embed], 
+      components: [navigation], 
+      flags: [MessageFlags.Ephemeral] 
+    });
   }
   else if (action === 'reset') {
     await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
@@ -934,24 +1162,105 @@ const handleConfig = async (interaction) => {
 // BUTTON HANDLER
 // ================================
 const handleButton = async (interaction) => {
-  const [action, runId] = interaction.customId.split('_');
+  const [action, param, userId] = interaction.customId.split('_');
   const config = getConfig();
   
+  // Config navigation buttons
+  if (action === 'config') {
+    if (interaction.user.id !== userId) {
+      return interaction.reply({ 
+        content: '❌ This configuration session belongs to another user', 
+        flags: [MessageFlags.Ephemeral] 
+      });
+    }
+    
+    const session = configSessions.get(userId);
+    if (!session) {
+      return interaction.reply({ 
+        content: '❌ Configuration session expired. Please run `/config action:configure` again', 
+        flags: [MessageFlags.Ephemeral] 
+      });
+    }
+    
+    if (param === 'next') {
+      const nextPage = Math.min(session.page + 1, 3);
+      const modal = createConfigPage(nextPage, userId);
+      await interaction.showModal(modal);
+    }
+    else if (param === 'prev') {
+      const prevPage = Math.max(session.page - 1, 1);
+      const modal = createConfigPage(prevPage, userId);
+      await interaction.showModal(modal);
+    }
+    else if (param === 'save') {
+      await interaction.deferUpdate();
+      
+      // Apply session config to bot config
+      botConfig = { ...session };
+      delete botConfig.page;
+      
+      updateGitHubToken();
+      
+      if (await saveAllConfigToDB()) {
+        const embed = new EmbedBuilder()
+          .setColor(COLORS.success)
+          .setTitle('✅ Configuration Saved Successfully!')
+          .setDescription('Your bot configuration has been saved to PostgreSQL database')
+          .addFields(
+            { name: '📦 Repository', value: botConfig.repo.owner && botConfig.repo.name ? 
+              `${botConfig.repo.owner}/${botConfig.repo.name}` : 'Not set', inline: true },
+            { name: '🔧 Workflow', value: botConfig.repo.workflowFile || 'Not set', inline: true },
+            { name: '🌿 Branch', value: botConfig.repo.branch || 'Not set', inline: true },
+            { name: '🔑 GitHub Token', value: botConfig.githubToken ? '✅ Set' : '❌ Missing', inline: true },
+            { name: '📢 Log Channel', value: botConfig.discord.logChannelId ? 
+              `<#${botConfig.discord.logChannelId}>` : 'Not set', inline: true },
+            { name: '👥 Allowed Roles', value: botConfig.discord.allowedRoleIds.length > 0 ? 
+              `${botConfig.discord.allowedRoleIds.length} role(s)` : 'None', inline: true }
+          )
+          .setFooter({ text: '🗄️ Configuration persisted in PostgreSQL' })
+          .setTimestamp();
+        
+        await interaction.editReply({ embeds: [embed], components: [] });
+        configSessions.delete(userId);
+        await sendLog(`⚙️ Configuration saved by ${interaction.user.tag}`, embed);
+      } else {
+        await interaction.editReply({ 
+          content: '❌ Failed to save configuration to database', 
+          components: [] 
+        });
+      }
+    }
+    else if (param === 'cancel') {
+      await interaction.deferUpdate();
+      configSessions.delete(userId);
+      
+      const embed = new EmbedBuilder()
+        .setColor(COLORS.cancelled)
+        .setTitle('🚫 Configuration Cancelled')
+        .setDescription('No changes were saved')
+        .setTimestamp();
+      
+      await interaction.editReply({ embeds: [embed], components: [] });
+    }
+    return;
+  }
+  
+  // Workflow control buttons (existing functionality)
   if (action === 'cancel') {
     await interaction.deferUpdate();
     try {
-      await octokit.actions.cancelWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: runId });
+      await octokit.actions.cancelWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: param });
       const embed = EmbedBuilder.from(interaction.message.embeds[0]).setColor(COLORS.cancelled).setFooter({ text: `Cancelled by ${interaction.user.tag}` });
       await interaction.editReply({ embeds: [embed], components: [] });
       await interaction.followUp({ content: '✅ Cancelled!', flags: [MessageFlags.Ephemeral] });
-      log(`Button cancel ${runId} by ${interaction.user.tag}`, 'INFO');
+      log(`Button cancel ${param} by ${interaction.user.tag}`, 'INFO');
     } catch (error) {
       return handleGitHubError(error, interaction);
     }
   } else if (action === 'refresh') {
     await interaction.deferUpdate();
     try {
-      const run = await getLatestRun(runId);
+      const run = await getLatestRun(param);
       const duration = run.updated_at && run.created_at ? formatDuration(new Date(run.updated_at) - new Date(run.created_at)) : 'N/A';
       const statusIcon = EMOJI.status[run.status] || '❓';
       const conclusionIcon = run.conclusion ? (EMOJI.conclusion[run.conclusion] || '❓') : '⏳';
@@ -1018,106 +1327,25 @@ client.once('ready', async () => {
 client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isModalSubmit()) {
-      if (interaction.customId === 'configModal') {
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+      if (interaction.customId.startsWith('configModal_')) {
+        const page = parseInt(interaction.customId.split('_')[1]);
+        const userId = interaction.user.id;
         
-        const githubToken = interaction.fields.getTextInputValue('githubToken').trim();
-        const repoDetails = interaction.fields.getTextInputValue('repoDetails').trim();
-        const workflowDetails = interaction.fields.getTextInputValue('workflowDetails').trim();
-        const discordSettings = interaction.fields.getTextInputValue('discordSettings').trim();
-        const featureToggles = interaction.fields.getTextInputValue('featureToggles').trim();
+        // Parse the modal inputs
+        const result = parseModalInput(interaction, page);
         
-        // Parse repository details
-        const repoLines = repoDetails.split('\n');
-        let repoOwner = '', repoName = '', branch = '';
-        repoLines.forEach(line => {
-          if (line.startsWith('Owner:')) {
-            repoOwner = line.replace('Owner:', '').trim();
-          } else if (line.startsWith('Name:')) {
-            repoName = line.replace('Name:', '').trim();
-          } else if (line.startsWith('Branch:')) {
-            branch = line.replace('Branch:', '').trim();
-          }
-        });
-        
-        // Parse Discord settings
-        const discordLines = discordSettings.split('\n');
-        let logChannelId = '', allowedRolesStr = '', guildId = '';
-        discordLines.forEach(line => {
-          if (line.startsWith('Log Channel:')) {
-            logChannelId = line.replace('Log Channel:', '').trim().replace(/[<#>]/g, '');
-          } else if (line.startsWith('Allowed Roles:')) {
-            allowedRolesStr = line.replace('Allowed Roles:', '').trim();
-          } else if (line.startsWith('Guild ID:')) {
-            guildId = line.replace('Guild ID:', '').trim();
-          }
-        });
-        
-        // Parse feature toggles
-        const featureLines = featureToggles.split('\n');
-        let requirePermissions = false, enableLogging = false, autoRefresh = false, refreshInterval = 30000;
-        featureLines.forEach(line => {
-          if (line.startsWith('Require Permissions:')) {
-            requirePermissions = line.replace('Require Permissions:', '').trim().toLowerCase() === 'true';
-          } else if (line.startsWith('Enable Logging:')) {
-            enableLogging = line.replace('Enable Logging:', '').trim().toLowerCase() === 'true';
-          } else if (line.startsWith('Auto Refresh:')) {
-            autoRefresh = line.replace('Auto Refresh:', '').trim().toLowerCase() === 'true';
-          } else if (line.startsWith('Refresh Interval:')) {
-            const interval = parseInt(line.replace('Refresh Interval:', '').trim());
-            if (!isNaN(interval) && interval >= 5000) {
-              refreshInterval = interval;
-            }
-          }
-        });
-        
-        // Parse allowed roles
-        let allowedRoleIds = [];
-        if (allowedRolesStr) {
-          allowedRoleIds = allowedRolesStr.split(',')
-            .map(id => id.trim().replace(/[<@&>]/g, ''))
-            .filter(id => id);
+        if (!result.success) {
+          return interaction.reply({ 
+            content: `❌ Error parsing configuration: ${result.error}`, 
+            flags: [MessageFlags.Ephemeral] 
+          });
         }
         
-        // Update configuration
-        if (githubToken) botConfig.githubToken = githubToken;
-        if (repoOwner) botConfig.repo.owner = repoOwner;
-        if (repoName) botConfig.repo.name = repoName;
-        if (workflowDetails) botConfig.repo.workflowFile = workflowDetails;
-        if (branch) botConfig.repo.branch = branch;
-        if (guildId) botConfig.guildId = guildId;
-        if (logChannelId) botConfig.discord.logChannelId = logChannelId;
-        if (allowedRoleIds.length > 0) botConfig.discord.allowedRoleIds = allowedRoleIds;
+        // Update the embed with new data
+        const embed = createConfigOverview(page, userId);
+        const navigation = createConfigNavigation(page, userId);
         
-        botConfig.features.requirePermissions = requirePermissions;
-        botConfig.features.enableLogging = enableLogging;
-        botConfig.features.autoRefreshStatus = autoRefresh;
-        botConfig.features.refreshInterval = refreshInterval;
-        
-        // Update GitHub token in Octokit
-        updateGitHubToken();
-        
-        // Save to database
-        if (await saveAllConfigToDB()) {
-          const embed = new EmbedBuilder()
-            .setColor(COLORS.success)
-            .setTitle('✅ Configuration Updated')
-            .setDescription('Your configuration has been saved to PostgreSQL!')
-            .addFields(
-              { name: '📦 Repository', value: botConfig.repo.owner && botConfig.repo.name ? 
-                `${botConfig.repo.owner}/${botConfig.repo.name}` : 'Not set', inline: true },
-              { name: '🔧 Workflow', value: botConfig.repo.workflowFile || 'Not set', inline: true },
-              { name: '🌿 Branch', value: botConfig.repo.branch || 'Not set', inline: true },
-              { name: '🔑 GitHub Token', value: botConfig.githubToken ? '✅ Set' : '❌ Missing', inline: true }
-            )
-            .setFooter({ text: '🗄️ Stored securely in PostgreSQL database' })
-            .setTimestamp();
-          
-          await interaction.editReply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
-          await sendLog(`⚙️ Configuration updated by ${interaction.user.tag}`, embed);
-        } else {
-          await interaction.editReply({ content: '❌ Failed to save configuration', flags: [MessageFlags.Ephemeral] });
-        }
+        await interaction.update({ embeds: [embed], components: [navigation] });
       }
     }
     else if (interaction.isChatInputCommand()) {
@@ -1143,6 +1371,7 @@ client.on('interactionCreate', async (interaction) => {
     }
   } catch (error) {
     log(`Interaction error: ${error.message}`, 'ERROR');
+    console.error(error);
     const msg = '❌ Error occurred. Try again later.';
     try {
       if (interaction.deferred) await interaction.editReply(msg);
