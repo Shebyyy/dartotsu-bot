@@ -1,6 +1,6 @@
-// Dartotsu Discord Bot
+// Dartotsu Discord Bot - Multi-Server Edition (Server Name Based)
 
-// --- 1. Polyfills & Imports ---
+// Polyfill ReadableStream
 if (typeof ReadableStream === 'undefined') {
   try {
     const streamWeb = require('stream/web');
@@ -35,38 +35,12 @@ const crypto = require('crypto');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
-// --- 2. Security & Constants ---
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '12345678901234567890123456789012'; 
+// ================================
+// SECURITY (ENCRYPTION)
+// ================================
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '12345678901234567890123456789012'; // Must be 32 chars
 const IV_LENGTH = 16;
 
-const EMOJI = {
-  platform: { all: '🌐', android: '🤖', windows: '🪟', linux: '🐧', ios: '🍎', macos: '💻' },
-  status: { completed: '✅', in_progress: '🔄', queued: '⏳', waiting: '⏸️', requested: '📝', pending: '⏳' },
-  conclusion: { success: '✅', failure: '❌', cancelled: '🚫', skipped: '⏭️', timed_out: '⏰', action_required: '⚠️', neutral: '➖' }
-};
-
-const COLORS = { success: 0x00FF00, failure: 0xFF0000, cancelled: 0xFFA500, in_progress: 0xFFFF00, queued: 0x808080, info: 0x5865F2, dark: 0x2B2D31 };
-
-// --- 3. Database & Config System ---
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
-  max: 20,
-  idleTimeoutMillis: 30000,
-});
-
-// Cache
-const serverConfigs = new Map();
-const cache = { branches: new Map() };
-
-const DEFAULT_CONFIG = {
-  githubToken: null,
-  repo: { owner: null, name: null, workflowFile: null, branch: 'main' },
-  discord: { allowedRoleIds: [], logChannelId: null },
-  features: { requirePermissions: false, enableLogging: false, autoRefreshStatus: false, refreshInterval: 30000 }
-};
-
-// Encryption Helpers
 const encrypt = (text) => {
   if (!text) return null;
   try {
@@ -75,7 +49,7 @@ const encrypt = (text) => {
     let encrypted = cipher.update(text);
     encrypted = Buffer.concat([encrypted, cipher.final()]);
     return iv.toString('hex') + ':' + encrypted.toString('hex');
-  } catch (e) { console.error('Encryption Error:', e.message); return text; }
+  } catch (e) { console.error('Encryption error:', e.message); return text; }
 };
 
 const decrypt = (text) => {
@@ -92,21 +66,53 @@ const decrypt = (text) => {
   } catch (e) { return null; }
 };
 
-// Config Helpers
+// ================================
+// POSTGRESQL DATABASE SYSTEM
+// ================================
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// In-Memory Storage: Map<ServerName, ConfigObject>
+const serverConfigs = new Map();
+const branchCache = new Map(); // Cache for autocomplete
+
+const DEFAULT_CONFIG = {
+  githubToken: null,
+  guildId: null, // Kept for legacy/global command support if needed
+  repo: { owner: null, name: null, workflowFile: null, branch: 'main' },
+  discord: { allowedRoleIds: [], logChannelId: null },
+  features: { requirePermissions: false, enableLogging: false, autoRefreshStatus: false, refreshInterval: 30000 }
+};
+
+// Helper to get config for a specific server name
 const getServerConfig = (serverName) => {
-  if (!serverConfigs.has(serverName)) return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+  if (!serverConfigs.has(serverName)) {
+    // Return deep copy of default
+    return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+  }
   return serverConfigs.get(serverName);
 };
 
+// Helper to get Octokit for a specific server
 const getOctokit = (serverName) => {
   const config = getServerConfig(serverName);
   if (!config.githubToken) return null;
-  return new Octokit({ auth: config.githubToken, request: { fetch: require('node-fetch') } });
+  return new Octokit({ 
+    auth: config.githubToken,
+    request: { fetch: require('node-fetch') }
+  });
 };
 
-// --- 4. Database Functions ---
+// Database functions
 const initDatabase = async () => {
   try {
+    // CHANGED: Table now supports server_name as part of Primary Key
     await pool.query(`
       CREATE TABLE IF NOT EXISTS server_configs (
         server_name VARCHAR(255),
@@ -117,16 +123,42 @@ const initDatabase = async () => {
         PRIMARY KEY (server_name, key)
       )
     `);
-    console.log('✅ Database initialized (Server Name Mode)');
-  } catch (error) { console.error(`Database Init Error: ${error.message}`); }
+    
+    // Keeping your Trigger logic
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION update_updated_at_column()
+      RETURNS TRIGGER AS $$       BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+      END;
+      $$ language 'plpgsql'
+    `);
+    
+    await pool.query(`DROP TRIGGER IF EXISTS update_server_configs_updated_at ON server_configs`);
+    
+    await pool.query(`
+      CREATE TRIGGER update_server_configs_updated_at
+        BEFORE UPDATE ON server_configs
+        FOR EACH ROW
+        EXECUTE FUNCTION update_updated_at_column()
+    `);
+    
+    log('PostgreSQL database initialized (Multi-Server)', 'INFO');
+  } catch (error) {
+    log(`Database init error: ${error.message}`, 'ERROR');
+  }
 };
 
 const loadConfigsFromDB = async () => {
   try {
     const { rows } = await pool.query("SELECT server_name, key, value FROM server_configs");
+    
     rows.forEach(row => {
       const { server_name, key, value } = row;
-      if (!serverConfigs.has(server_name)) serverConfigs.set(server_name, JSON.parse(JSON.stringify(DEFAULT_CONFIG)));
+      
+      if (!serverConfigs.has(server_name)) {
+        serverConfigs.set(server_name, JSON.parse(JSON.stringify(DEFAULT_CONFIG)));
+      }
       const config = serverConfigs.get(server_name);
 
       switch(key) {
@@ -135,7 +167,10 @@ const loadConfigsFromDB = async () => {
         case 'repoName': config.repo.name = value; break;
         case 'workflowFile': config.repo.workflowFile = value; break;
         case 'branch': config.repo.branch = value; break;
-        case 'allowedRoles': try { config.discord.allowedRoleIds = JSON.parse(value); } catch (e) {} break;
+        case 'guildId': config.guildId = value; break;
+        case 'allowedRoles': 
+          try { config.discord.allowedRoleIds = value ? JSON.parse(value) : []; } catch (e) { config.discord.allowedRoleIds = []; }
+          break;
         case 'logChannelId': config.discord.logChannelId = value; break;
         case 'requirePermissions': config.features.requirePermissions = value === 'true'; break;
         case 'enableLogging': config.features.enableLogging = value === 'true'; break;
@@ -143,8 +178,11 @@ const loadConfigsFromDB = async () => {
         case 'refreshInterval': config.features.refreshInterval = parseInt(value) || 30000; break;
       }
     });
-    console.log(`✅ Loaded configurations for ${serverConfigs.size} servers`);
-  } catch (error) { console.error(`DB Load Error: ${error.message}`); }
+    
+    log(`Configuration loaded for ${serverConfigs.size} servers`, 'INFO');
+  } catch (error) {
+    log(`Database load error: ${error.message}`, 'ERROR');
+  }
 };
 
 const saveServerConfig = async (serverName, key, value) => {
@@ -153,27 +191,99 @@ const saveServerConfig = async (serverName, key, value) => {
       "INSERT INTO server_configs (server_name, key, value) VALUES ($1, $2, $3) ON CONFLICT (server_name, key) DO UPDATE SET value = $3, updated_at = CURRENT_TIMESTAMP",
       [serverName, key, value]
     );
+    
+    // Update memory immediately
     if (!serverConfigs.has(serverName)) serverConfigs.set(serverName, JSON.parse(JSON.stringify(DEFAULT_CONFIG)));
     const config = serverConfigs.get(serverName);
     
-    // Update memory
-    switch(key) {
-      case 'githubToken': config.githubToken = key === 'githubToken' ? decrypt(value) : value; break;
-      case 'repoOwner': config.repo.owner = value; break;
-      case 'repoName': config.repo.name = value; break;
-      case 'workflowFile': config.repo.workflowFile = value; break;
-      case 'branch': config.repo.branch = value; break;
-      case 'allowedRoles': config.discord.allowedRoleIds = JSON.parse(value); break;
-      case 'logChannelId': config.discord.logChannelId = value; break;
-      case 'requirePermissions': config.features.requirePermissions = value === 'true'; break;
-      case 'enableLogging': config.features.enableLogging = value === 'true'; break;
-      case 'autoRefreshStatus': config.features.autoRefreshStatus = value === 'true'; break;
-      case 'refreshInterval': config.features.refreshInterval = parseInt(value); break;
-    }
-  } catch (error) { console.error(`Save Config Error: ${error.message}`); }
+    // Update specific key in memory
+    if (key === 'githubToken') config.githubToken = decrypt(value); // Value passed here should be encrypted string, decrypt for memory
+    else if (key === 'repoOwner') config.repo.owner = value;
+    else if (key === 'repoName') config.repo.name = value;
+    else if (key === 'workflowFile') config.repo.workflowFile = value;
+    else if (key === 'branch') config.repo.branch = value;
+    else if (key === 'guildId') config.guildId = value;
+    else if (key === 'allowedRoles') config.discord.allowedRoleIds = JSON.parse(value);
+    else if (key === 'logChannelId') config.discord.logChannelId = value;
+    else if (key === 'requirePermissions') config.features.requirePermissions = value === 'true';
+    else if (key === 'enableLogging') config.features.enableLogging = value === 'true';
+    else if (key === 'autoRefreshStatus') config.features.autoRefreshStatus = value === 'true';
+    else if (key === 'refreshInterval') config.features.refreshInterval = parseInt(value);
+
+  } catch (error) {
+    log(`Save config error for ${key}: ${error.message}`, 'ERROR');
+    throw error;
+  }
 };
 
-// --- 5. Utility & Formatting ---
+const testDatabaseConnection = async () => {
+  try {
+    const client = await pool.connect();
+    await client.query('SELECT NOW()');
+    client.release();
+    log('PostgreSQL connection successful', 'INFO');
+    return true;
+  } catch (error) {
+    log(`Database connection failed: ${error.message}`, 'ERROR');
+    return false;
+  }
+};
+
+// ================================
+// CONSTANTS
+// ================================
+const EMOJI = {
+  platform: { all: '🌐', android: '🤖', windows: '🪟', linux: '🐧', ios: '🍎', macos: '💻' },
+  status: { completed: '✅', in_progress: '🔄', queued: '⏳', waiting: '⏸️', requested: '📝', pending: '⏳' },
+  conclusion: { success: '✅', failure: '❌', cancelled: '🚫', skipped: '⏭️', timed_out: '⏰', action_required: '⚠️', neutral: '➖' }
+};
+
+const COLORS = { success: 0x00FF00, failure: 0xFF0000, cancelled: 0xFFA500, in_progress: 0xFFFF00, queued: 0x808080, info: 0x5865F2, dark: 0x2B2D31 };
+
+// ================================
+// UTILITY FUNCTIONS
+// ================================
+const log = (msg, level = 'INFO', serverName = null) => {
+  const logMsg = `[${new Date().toISOString()}] [${level}] ${serverName ? `[${serverName}] ` : ''}${msg}`;
+  console.log(logMsg);
+  
+  // Check if we should log to file based on server config
+  let shouldLog = false;
+  if (serverName) {
+    const config = getServerConfig(serverName);
+    if (config.features.enableLogging) shouldLog = true;
+  } else {
+    shouldLog = true; // Always log system events to console, potentially file if needed
+  }
+
+  if (shouldLog) {
+    try {
+      const logDir = path.join(__dirname, 'logs');
+      if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
+      fs.appendFileSync(path.join(logDir, `bot-${new Date().toISOString().split('T')[0]}.log`), logMsg + '\n');
+    } catch (e) { console.error(`Log error: ${e.message}`); }
+  }
+};
+
+const checkPermissions = async (interaction) => {
+  const config = getServerConfig(interaction.guild.name);
+  if (interaction.member.permissions.has(PermissionFlagsBits.Administrator) || 
+      !config.features.requirePermissions || 
+      config.discord.allowedRoleIds.length === 0 ||
+      interaction.member.roles.cache.some(role => config.discord.allowedRoleIds.includes(role.id))) return true;
+  await interaction.reply({ content: '❌ No permission', flags: [MessageFlags.Ephemeral] });
+  return false;
+};
+
+const sendLog = async (serverName, msg, embed = null) => {
+  const config = getServerConfig(serverName);
+  if (!config.discord.logChannelId) return;
+  try {
+    const channel = await client.channels.fetch(config.discord.logChannelId);
+    if (channel?.isTextBased()) await channel.send(embed ? { content: msg, embeds: [embed] } : msg);
+  } catch (e) { log(`Log send error: ${e.message}`, 'ERROR', serverName); }
+};
+
 const formatDuration = (ms) => {
   const s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60);
   return h > 0 ? `${h}h ${m % 60}m` : m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
@@ -186,32 +296,6 @@ const formatBytes = (bytes) => {
   return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
 };
 
-const log = (msg, level = 'INFO', serverName = null) => {
-  const logMsg = `[${new Date().toISOString()}] [${level}] ${serverName ? `[${serverName}] ` : ''}${msg}`;
-  console.log(logMsg);
-  
-  // Detailed File Logging
-  if (serverName) {
-    const config = getServerConfig(serverName);
-    if (config && config.features.enableLogging) {
-      try {
-        const logDir = path.join(__dirname, 'logs');
-        if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
-        fs.appendFileSync(path.join(logDir, `bot-${new Date().toISOString().split('T')[0]}.log`), logMsg + '\n');
-      } catch (e) { console.error(`Log Write Error: ${e.message}`); }
-    }
-  }
-};
-
-const sendLog = async (serverName, msg, embed = null) => {
-  const config = getServerConfig(serverName);
-  if (!config.discord.logChannelId) return;
-  try {
-    const channel = await client.channels.fetch(config.discord.logChannelId);
-    if (channel?.isTextBased()) await channel.send(embed ? { content: msg, embeds: [embed] } : msg);
-  } catch (e) { log(`Log send error: ${e.message}`, 'ERROR', serverName); }
-};
-
 const createButtons = (runId, url, showCancel = false) => {
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setLabel('GitHub').setStyle(ButtonStyle.Link).setURL(url).setEmoji('🔗')
@@ -221,96 +305,139 @@ const createButtons = (runId, url, showCancel = false) => {
   return row;
 };
 
+const getLatestRun = async (serverName, runId = null, status = null) => {
+  const config = getServerConfig(serverName);
+  const octokit = getOctokit(serverName);
+  if (!config.repo.owner || !config.repo.name || !config.repo.workflowFile || !octokit) return null;
+  
+  if (runId) return (await octokit.actions.getWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: runId })).data;
+  const params = { owner: config.repo.owner, repo: config.repo.name, workflow_id: config.repo.workflowFile, per_page: 1 };
+  if (status) params.status = status;
+  const { data: runs } = await octokit.actions.listWorkflowRuns(params);
+  return runs.workflow_runs[0] || null;
+};
+
+const createRunEmbed = (run, title = '📊 Workflow Status') => {
+  const duration = run.updated_at && run.created_at ? formatDuration(new Date(run.updated_at) - new Date(run.created_at)) : 'N/A';
+  const statusIcon = EMOJI.status[run.status] || '❓';
+  const conclusionIcon = run.conclusion ? (EMOJI.conclusion[run.conclusion] || '❓') : '⏳';
+  const color = run.conclusion === 'success' ? COLORS.success : run.conclusion === 'failure' ? COLORS.failure : 
+                run.status === 'in_progress' ? COLORS.in_progress : COLORS.queued;
+  
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setURL(run.html_url)
+    .setDescription(`**${run.display_title || run.name}**`)
+    .addFields(
+      { name: '📍 Status', value: `${statusIcon} ${run.status.replace('_', ' ').toUpperCase()}`, inline: true },
+      { name: '🎯 Conclusion', value: run.conclusion ? `${conclusionIcon} ${run.conclusion.toUpperCase()}` : '⏳ Running', inline: true },
+      { name: '⏱️ Duration', value: duration, inline: true },
+      { name: '🌿 Branch', value: `\`${run.head_branch}\``, inline: true },
+      { name: '🔢 Run', value: `#${run.run_number}`, inline: true },
+      { name: '🆔 ID', value: `\`${run.id}\``, inline: true }
+    )
+    .setTimestamp();
+};
+
 const handleGitHubError = (error, interaction) => {
   log(`GitHub API error: ${error.message}`, 'ERROR', interaction.guild?.name);
+  
   let errorMessage = '❌ GitHub API Error';
   let errorDetails = error.message;
   
-  if (error.status === 401) { errorMessage = '❌ Invalid GitHub Token'; errorDetails = 'Token invalid or expired. Update in /config'; }
-  else if (error.status === 403) { errorMessage = '❌ Permission Denied'; errorDetails = 'Missing scopes or private repo access'; }
-  else if (error.status === 404) { errorMessage = '❌ Not Found'; errorDetails = 'Repo, workflow, or branch not found'; }
+  if (error.status === 401) { errorMessage = '❌ Invalid GitHub Token'; errorDetails = 'Token is invalid or expired.'; }
+  else if (error.status === 403) { errorMessage = '❌ Permission Denied'; errorDetails = 'Token missing scopes or private repo.'; }
+  else if (error.status === 404) { errorMessage = '❌ Not Found'; errorDetails = 'Repo or workflow not found.'; }
   
-  const embed = new EmbedBuilder().setColor(COLORS.failure).setTitle(errorMessage).setDescription(errorDetails).setTimestamp();
-  if (interaction.replied || interaction.deferred) return interaction.editReply({ embeds: [embed] });
-  return interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+  const errorEmbed = new EmbedBuilder().setColor(COLORS.failure).setTitle(errorMessage).setDescription(errorDetails).setTimestamp();
+  if (interaction.replied || interaction.deferred) return interaction.editReply({ embeds: [errorEmbed] });
+  return interaction.reply({ embeds: [errorEmbed], flags: [MessageFlags.Ephemeral] });
 };
 
-// --- 6. UI Components (Dashboard) ---
+// ================================
+// NEW UI: DASHBOARD (REPLACES PAGE 1/2/3)
+// ================================
+
 const getConfigEmbed = (serverName) => {
   const config = getServerConfig(serverName);
+  const isTokenSet = !!config.githubToken;
+  const isRepoSet = !!(config.repo.owner && config.repo.name);
+
   return new EmbedBuilder()
     .setColor(COLORS.dark)
-    .setTitle(`⚙️ Configuration: ${serverName}`)
-    .setDescription('Select a category below to configure the bot for this server.')
+    .setTitle(`⚙️ Config for "${serverName}"`)
+    .setDescription('Settings are tied to this **Server Name**.')
     .addFields(
-      { name: '🐙 GitHub', value: `**Token:** ${config.githubToken ? '✅ Set' : '❌ No'}\n**Repo:** ${config.repo.owner}/${config.repo.name || '?'}\n**Workflow:** \`${config.repo.workflowFile || '?'}\`\n**Branch:** \`${config.repo.branch || '?'}\``, inline: true },
-      { name: '💬 Discord', value: `**Log Channel:** ${config.discord.logChannelId ? `<#${config.discord.logChannelId}>` : 'None'}\n**Roles:** ${config.discord.allowedRoleIds.length > 0 ? `${config.discord.allowedRoleIds.length} roles` : 'All'}`, inline: true },
+      { name: '🐙 GitHub', value: `**Token:** ${isTokenSet ? '✅ Set' : '❌ No'}\n**Repo:** ${isRepoSet ? `${config.repo.owner}/${config.repo.name}` : '❌ No'}\n**Workflow:** \`${config.repo.workflowFile || 'None'}\`\n**Branch:** \`${config.repo.branch || 'main'}\``, inline: true },
+      { name: '💬 Discord', value: `**Logs:** ${config.discord.logChannelId ? `<#${config.discord.logChannelId}>` : 'None'}\n**Roles:** ${config.discord.allowedRoleIds.length} allowed`, inline: true },
       { name: '🎛️ Features', value: `**Perms:** ${config.features.requirePermissions ? '✅' : '❌'}\n**Logs:** ${config.features.enableLogging ? '✅' : '❌'}\n**Auto-Refresh:** ${config.features.autoRefreshStatus ? '✅' : '❌'}`, inline: false }
     )
-    .setFooter({ text: 'Settings are tied to the Server Name' });
+    .setFooter({ text: 'Use the menu below to edit.' });
 };
 
 const getConfigComponents = () => {
-  return [
-    new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder().setCustomId('config_menu').setPlaceholder('Select category...')
-        .addOptions(
-          new StringSelectMenuOptionBuilder().setLabel('GitHub Settings').setValue('cfg_github').setEmoji('🐙'),
-          new StringSelectMenuOptionBuilder().setLabel('Discord Settings').setValue('cfg_discord').setEmoji('💬'),
-          new StringSelectMenuOptionBuilder().setLabel('Feature Toggles').setValue('cfg_features').setEmoji('🎛️')
-        )
-    ),
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('cfg_refresh').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('cfg_test').setLabel('Test Token').setStyle(ButtonStyle.Primary)
-    )
-  ];
+  const selectMenu = new StringSelectMenuBuilder().setCustomId('config_menu').setPlaceholder('Select category to configure...')
+    .addOptions(
+      new StringSelectMenuOptionBuilder().setLabel('GitHub Settings').setValue('cfg_github').setEmoji('🐙'),
+      new StringSelectMenuOptionBuilder().setLabel('Discord Settings').setValue('cfg_discord').setEmoji('💬'),
+      new StringSelectMenuOptionBuilder().setLabel('Feature Toggles').setValue('cfg_features').setEmoji('🎛️')
+    );
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('cfg_refresh').setLabel('Refresh Dashboard').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('cfg_test').setLabel('Test GitHub Connection').setStyle(ButtonStyle.Primary)
+  );
+  return [new ActionRowBuilder().addComponents(selectMenu), row];
 };
 
-// --- 7. Command Handlers ---
+// ================================
+// COMMAND HANDLERS
+// ================================
 
 const handleBuild = async (interaction) => {
   await interaction.deferReply();
   const serverName = interaction.guild.name;
   const config = getServerConfig(serverName);
   const octokit = getOctokit(serverName);
-
-  if (!octokit || !config.repo.owner) return interaction.editReply({ content: '❌ Bot not configured. Use `/config`.' });
-
+  
+  if (!config.githubToken || !config.repo.owner) {
+    return await interaction.editReply({ content: '❌ Bot not configured. Use `/config`.' });
+  }
+  
   const platform = interaction.options.getString('platform');
   const branch = interaction.options.getString('branch') || config.repo.branch;
-  const clean = interaction.options.getBoolean('clean_build') ?? false;
-  const ping = interaction.options.getBoolean('ping_discord') ?? false;
+  const cleanBuild = interaction.options.getBoolean('clean_build') ?? false;
+  const pingDiscord = interaction.options.getBoolean('ping_discord') ?? false;
 
   try {
     await octokit.actions.createWorkflowDispatch({
       owner: config.repo.owner, repo: config.repo.name, workflow_id: config.repo.workflowFile, ref: branch,
-      inputs: { build_targets: platform, clean_build: clean.toString(), ping_discord: ping.toString() }
+      inputs: { build_targets: platform, clean_build: cleanBuild.toString(), ping_discord: pingDiscord.toString() }
     });
 
     await new Promise(r => setTimeout(r, 2000));
-    
-    // Fetch latest run
-    const { data } = await octokit.actions.listWorkflowRuns({ owner: config.repo.owner, repo: config.repo.name, workflow_id: config.repo.workflowFile, per_page: 1 });
-    const run = data.workflow_runs[0];
+    const latestRun = await getLatestRun(serverName).catch(() => null);
 
     const embed = new EmbedBuilder()
       .setColor(COLORS.success)
-      .setTitle('🚀 Build Triggered')
+      .setTitle('✅ Build Triggered')
       .setDescription('Dartotsu build workflow started!')
       .addFields(
-        { name: 'Target', value: `${EMOJI.platform[platform] || '📦'} ${platform.toUpperCase()}`, inline: true },
-        { name: 'Branch', value: `\`${branch}\``, inline: true },
-        { name: 'Clean', value: clean ? '✅' : '❌', inline: true },
-        { name: 'Initiator', value: interaction.user.tag, inline: true }
+        { name: '🎯 Platform', value: `${EMOJI.platform[platform] || '📦'} **${platform.toUpperCase()}**`, inline: true },
+        { name: '🧹 Clean', value: cleanBuild ? '✅' : '❌', inline: true },
+        { name: '👤 By', value: interaction.user.tag, inline: true },
+        { name: '🌿 Branch', value: `\`${branch}\``, inline: true }
       )
       .setTimestamp();
-      
-    if (run) embed.setURL(run.html_url);
 
-    await interaction.editReply({ embeds: [embed], components: run ? [createButtons(run.id, run.html_url, true)] : [] });
-    sendLog(serverName, `🚀 Build ${platform} started by ${interaction.user.tag}`, embed);
-  } catch (e) { handleGitHubError(e, interaction); }
+    if (latestRun) embed.setURL(latestRun.html_url);
+    const components = latestRun ? [createButtons(latestRun.id, latestRun.html_url, true)] : [];
+    
+    await interaction.editReply({ embeds: [embed], components });
+    sendLog(serverName, `🚀 Build ${platform} by ${interaction.user.tag}`, embed);
+  } catch (error) {
+    return handleGitHubError(error, interaction);
+  }
 };
 
 const handleStatus = async (interaction) => {
@@ -319,88 +446,128 @@ const handleStatus = async (interaction) => {
   const config = getServerConfig(serverName);
   const octokit = getOctokit(serverName);
   
-  if (!octokit) return interaction.editReply('❌ Not Configured');
-
+  if (!config.githubToken) return await interaction.editReply({ content: '❌ Bot not configured.' });
+  
   const limit = interaction.options.getInteger('limit') || 5;
   const autoRefresh = interaction.options.getBoolean('auto_refresh') ?? config.features.autoRefreshStatus;
 
   try {
-    const { data } = await octokit.actions.listWorkflowRuns({
+    const { data: runs } = await octokit.actions.listWorkflowRuns({
       owner: config.repo.owner, repo: config.repo.name, workflow_id: config.repo.workflowFile, per_page: limit
     });
-
-    if (!data.workflow_runs.length) return interaction.editReply('📭 No runs found');
-
-    const latest = data.workflow_runs[0];
-    const duration = latest.updated_at && latest.created_at ? formatDuration(new Date(latest.updated_at) - new Date(latest.created_at)) : 'N/A';
-    const icon = latest.conclusion ? EMOJI.conclusion[latest.conclusion] : EMOJI.status[latest.status];
     
-    const embed = new EmbedBuilder()
-      .setColor(latest.conclusion === 'success' ? COLORS.success : latest.conclusion === 'failure' ? COLORS.failure : COLORS.in_progress)
-      .setTitle('📊 Workflow Status')
-      .setDescription(`**${latest.display_title}**`)
-      .addFields(
-        { name: 'Status', value: `${icon} ${latest.status.toUpperCase()}`, inline: true },
-        { name: 'Conclusion', value: latest.conclusion || 'Running', inline: true },
-        { name: 'Duration', value: duration, inline: true },
-        { name: 'Branch', value: `\`${latest.head_branch}\``, inline: true },
-        { name: 'Run #', value: `${latest.run_number}`, inline: true }
-      )
-      .setURL(latest.html_url)
-      .setTimestamp();
+    if (!runs.workflow_runs.length) return interaction.editReply('📭 No workflows found');
 
-    if (data.workflow_runs.length > 1) {
-      const recent = data.workflow_runs.slice(1).map(r => {
-        const i = r.conclusion ? EMOJI.conclusion[r.conclusion] : EMOJI.status[r.status];
-        return `${i} [#${r.run_number}](${r.html_url}) - ${r.head_branch}`;
+    const latestRun = runs.workflow_runs[0];
+    const embed = createRunEmbed(latestRun, '📊 Latest Workflow Status');
+    if (autoRefresh) embed.setFooter({ text: '🔄 Auto-refresh enabled' });
+    
+    if (runs.workflow_runs.length > 1) {
+      const recent = runs.workflow_runs.slice(1, limit).map(r => {
+        const icon = r.conclusion ? (EMOJI.conclusion[r.conclusion] || '❓') : (EMOJI.status[r.status] || '❓');
+        return `${icon} [#${r.run_number}](${r.html_url}) - ${r.head_branch} - <t:${Math.floor(new Date(r.created_at).getTime() / 1000)}:R>`;
       }).join('\n');
-      embed.addFields({ name: '📋 Recent', value: recent });
+      embed.addFields({ name: `📋 Recent (${limit - 1})`, value: recent });
     }
 
-    const showCancel = latest.status === 'in_progress' || latest.status === 'queued';
-    await interaction.editReply({ embeds: [embed], components: [createButtons(latest.id, latest.html_url, showCancel)] });
+    const showCancel = latestRun.status === 'in_progress' || latestRun.status === 'queued';
+    await interaction.editReply({ embeds: [embed], components: [createButtons(latestRun.id, latestRun.html_url, showCancel)] });
 
     if (autoRefresh && showCancel) {
       setTimeout(async () => {
         try {
-          const { data: refData } = await octokit.actions.getWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: latest.id });
-          if (refData.status === 'completed') {
-            const doneEmbed = new EmbedBuilder().setColor(COLORS.success).setTitle(`✅ Build ${refData.conclusion}`).setDescription(`Run #${refData.run_number} finished.`);
-            await interaction.followUp({ embeds: [doneEmbed] });
+          const run = await getLatestRun(serverName, latestRun.id);
+          if (run.status === 'completed') {
+            await interaction.followUp({ content: `✅ Run #${run.run_number} finished!`, flags: [MessageFlags.Ephemeral] });
           }
-        } catch(e) {}
+        } catch (e) { }
       }, config.features.refreshInterval);
     }
-  } catch (e) { handleGitHubError(e, interaction); }
+  } catch (error) {
+    return handleGitHubError(error, interaction);
+  }
 };
 
-const handleBotInfo = async (interaction) => {
+const handleCancel = async (interaction) => {
+  await interaction.deferReply();
   const serverName = interaction.guild.name;
   const config = getServerConfig(serverName);
-  const uptime = formatDuration(process.uptime() * 1000);
-  const memory = formatBytes(process.memoryUsage().heapUsed);
+  const octokit = getOctokit(serverName);
+  
+  if (!config.githubToken) return await interaction.editReply({ content: '❌ Bot not configured.' });
+  
+  let runId = interaction.options.getString('run_id');
 
-  const embed = new EmbedBuilder()
-    .setColor(COLORS.info)
-    .setTitle('🤖 Dartotsu Build Bot')
-    .setDescription('Multi-Server Edition')
-    .addFields(
-      { name: '📦 Repo', value: config.repo.owner ? `${config.repo.owner}/${config.repo.name}` : 'Not Set', inline: true },
-      { name: '🔧 Workflow', value: config.repo.workflowFile || 'Not Set', inline: true },
-      { name: '⏰ Uptime', value: uptime, inline: true },
-      { name: '💾 Memory', value: memory, inline: true },
-      { name: '📡 Ping', value: `${client.ws.ping}ms`, inline: true },
-      { name: '🟢 Status', value: 'Online', inline: true }
-    )
-    .setThumbnail(client.user.displayAvatarURL())
-    .setFooter({ text: interaction.user.tag, iconURL: interaction.user.displayAvatarURL() });
+  try {
+    if (!runId) {
+      const run = await getLatestRun(serverName, null, 'in_progress');
+      if (!run) return interaction.editReply('❌ No running workflows');
+      runId = run.id;
+    }
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setLabel('Repository').setStyle(ButtonStyle.Link).setURL(config.repo.owner ? `https://github.com/${config.repo.owner}/${config.repo.name}` : 'https://github.com').setEmoji('📦'),
-    new ButtonBuilder().setLabel('Actions').setStyle(ButtonStyle.Link).setURL(config.repo.owner ? `https://github.com/${config.repo.owner}/${config.repo.name}/actions` : 'https://github.com').setEmoji('⚡')
-  );
+    await octokit.actions.cancelWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: runId });
+    
+    const embed = new EmbedBuilder().setColor(COLORS.cancelled).setTitle('🚫 Workflow Cancelled').setDescription(`Run #${runId} cancelled`).addFields({ name: 'By', value: interaction.user.tag });
+    await interaction.editReply({ embeds: [embed] });
+    sendLog(serverName, `Cancelled ${runId} by ${interaction.user.tag}`);
+  } catch (error) {
+    return handleGitHubError(error, interaction);
+  }
+};
 
-  await interaction.reply({ embeds: [embed], components: [row] });
+const handleLogs = async (interaction) => {
+  await interaction.deferReply();
+  const serverName = interaction.guild.name;
+  const config = getServerConfig(serverName);
+  if (!config.githubToken) return await interaction.editReply({ content: '❌ Bot not configured.' });
+  
+  let runId = interaction.options.getString('run_id');
+
+  try {
+    const run = runId ? await getLatestRun(serverName, runId) : await getLatestRun(serverName);
+    if (!run) return interaction.editReply('❌ No workflows found');
+
+    const embed = new EmbedBuilder()
+      .setColor(COLORS.info)
+      .setTitle('📋 Workflow Logs')
+      .setDescription(`Logs for run #${run.run_number}\n[Click to View](${run.html_url})`)
+      .addFields(
+        { name: 'Status', value: run.status, inline: true },
+        { name: 'Conclusion', value: run.conclusion || 'Running', inline: true }
+      );
+
+    await interaction.editReply({ embeds: [embed], components: [createButtons(run.id, run.html_url, false)] });
+  } catch (error) {
+    return handleGitHubError(error, interaction);
+  }
+};
+
+const handleArtifacts = async (interaction) => {
+  await interaction.deferReply();
+  const serverName = interaction.guild.name;
+  const config = getServerConfig(serverName);
+  const octokit = getOctokit(serverName);
+  if (!config.githubToken) return await interaction.editReply({ content: '❌ Bot not configured.' });
+  
+  let runId = interaction.options.getString('run_id');
+
+  try {
+    const run = runId ? await getLatestRun(serverName, runId) : await getLatestRun(serverName);
+    if (!run) return interaction.editReply('❌ No workflows found');
+
+    const { data: artifacts } = await octokit.actions.listWorkflowRunArtifacts({
+      owner: config.repo.owner, repo: config.repo.name, run_id: run.id
+    });
+
+    if (!artifacts.artifacts.length) return interaction.editReply('📭 No artifacts found');
+
+    const list = artifacts.artifacts.map(a => `**${a.name}** (${formatBytes(a.size_in_bytes)}) - ${a.expired ? 'Expired' : 'Available'}`).join('\n');
+    const embed = new EmbedBuilder().setColor(COLORS.info).setTitle('📦 Build Artifacts').setDescription(list).setFooter({ text: 'Download from GitHub Actions' });
+
+    await interaction.editReply({ embeds: [embed] });
+  } catch (error) {
+    return handleGitHubError(error, interaction);
+  }
 };
 
 const handleHistory = async (interaction) => {
@@ -408,18 +575,20 @@ const handleHistory = async (interaction) => {
   const serverName = interaction.guild.name;
   const config = getServerConfig(serverName);
   const octokit = getOctokit(serverName);
-  if (!octokit) return interaction.editReply('❌ Not Configured');
-
+  if (!config.githubToken) return await interaction.editReply({ content: '❌ Bot not configured.' });
+  
   const days = interaction.options.getInteger('days') || 7;
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
   try {
-    const { data } = await octokit.actions.listWorkflowRuns({
+    const { data: runs } = await octokit.actions.listWorkflowRuns({
       owner: config.repo.owner, repo: config.repo.name, workflow_id: config.repo.workflowFile,
       per_page: 100, created: `>=${since.toISOString()}`
     });
 
-    const stats = data.workflow_runs.reduce((acc, r) => {
+    if (!runs.workflow_runs.length) return interaction.editReply(`📭 No runs in ${days} day(s)`);
+
+    const stats = runs.workflow_runs.reduce((acc, r) => {
       acc.total++;
       if (r.conclusion === 'success') acc.success++;
       else if (r.conclusion === 'failure') acc.failure++;
@@ -429,120 +598,52 @@ const handleHistory = async (interaction) => {
       return acc;
     }, { total: 0, success: 0, failure: 0, cancelled: 0, inProgress: 0, totalDuration: 0 });
 
-    const avgDuration = stats.total ? formatDuration(stats.totalDuration / stats.total) : '0s';
-    const successRate = stats.total ? ((stats.success / stats.total) * 100).toFixed(1) : 0;
+    const successRate = ((stats.success / stats.total) * 100).toFixed(1);
+    const avgDuration = formatDuration(stats.totalDuration / stats.total);
 
     const embed = new EmbedBuilder()
       .setColor(COLORS.info)
       .setTitle('📊 Workflow Statistics')
-      .setDescription(`Last ${days} days`)
+      .setDescription(`Last ${days} day(s)`)
       .addFields(
         { name: 'Total', value: `${stats.total}`, inline: true },
         { name: 'Success', value: `${stats.success} (${successRate}%)`, inline: true },
         { name: 'Failed', value: `${stats.failure}`, inline: true },
-        { name: 'Avg Duration', value: avgDuration, inline: true }
-      )
-      .setTimestamp();
+        { name: 'Duration (Avg)', value: avgDuration, inline: true }
+      );
 
     await interaction.editReply({ embeds: [embed] });
-  } catch (e) { handleGitHubError(e, interaction); }
+  } catch (error) {
+    return handleGitHubError(error, interaction);
+  }
 };
 
-const handleArtifacts = async (interaction) => {
-  await interaction.deferReply();
+const handleBotInfo = async (interaction) => {
   const serverName = interaction.guild.name;
   const config = getServerConfig(serverName);
-  const octokit = getOctokit(serverName);
-  if (!octokit) return interaction.editReply('❌ Not Configured');
+  const uptime = formatDuration(process.uptime() * 1000);
+  const memory = formatBytes(process.memoryUsage().heapUsed);
+  
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.info)
+    .setTitle('🤖 Dartotsu Build Bot')
+    .setDescription('Multi-Server Edition')
+    .addFields(
+      { name: '📦 Repo', value: config.repo.owner ? `${config.repo.owner}/${config.repo.name}` : 'Not configured', inline: true },
+      { name: '⏰ Uptime', value: uptime, inline: true },
+      { name: '🌐 Servers', value: `${client.guilds.cache.size}`, inline: true },
+      { name: '💾 Memory', value: memory, inline: true },
+      { name: '🔗 Version', value: '3.0.0', inline: true },
+      { name: '📡 Ping', value: `${client.ws.ping}ms`, inline: true }
+    )
+    .setThumbnail(client.user.displayAvatarURL())
+    .setFooter({ text: interaction.user.tag });
 
-  const runId = interaction.options.getString('run_id');
-  try {
-    let targetRunId = runId;
-    if (!targetRunId) {
-      const { data } = await octokit.actions.listWorkflowRuns({ owner: config.repo.owner, repo: config.repo.name, workflow_id: config.repo.workflowFile, per_page: 1 });
-      if (data.workflow_runs[0]) targetRunId = data.workflow_runs[0].id;
-    }
-    if (!targetRunId) return interaction.editReply('❌ No runs found');
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel('Repo').setStyle(ButtonStyle.Link).setURL('https://github.com/Shebyyy/Dartotsu').setEmoji('📦')
+  );
 
-    const { data } = await octokit.actions.listWorkflowRunArtifacts({ owner: config.repo.owner, repo: config.repo.name, run_id: targetRunId });
-    
-    if (!data.artifacts.length) return interaction.editReply('📭 No artifacts found for this run.');
-
-    const list = data.artifacts.map(a => `**${a.name}**\n📦 ${formatBytes(a.size_in_bytes)} • ${a.expired ? 'Expired' : 'Available'}`).join('\n\n');
-    const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(`📦 Artifacts (Run #${targetRunId})`).setDescription(list).setFooter({ text: 'Download via GitHub Actions' });
-    
-    await interaction.editReply({ embeds: [embed] });
-  } catch (e) { handleGitHubError(e, interaction); }
-};
-
-const handleLogs = async (interaction) => {
-  await interaction.deferReply();
-  const serverName = interaction.guild.name;
-  const config = getServerConfig(serverName);
-  const octokit = getOctokit(serverName);
-  if (!octokit) return interaction.editReply('❌ Not Configured');
-
-  const runId = interaction.options.getString('run_id');
-  try {
-    let run;
-    if (runId) {
-      const { data } = await octokit.actions.getWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: runId });
-      run = data;
-    } else {
-      const { data } = await octokit.actions.listWorkflowRuns({ owner: config.repo.owner, repo: config.repo.name, workflow_id: config.repo.workflowFile, per_page: 1 });
-      run = data.workflow_runs[0];
-    }
-
-    if (!run) return interaction.editReply('❌ No runs found');
-
-    const embed = new EmbedBuilder()
-      .setColor(COLORS.info)
-      .setTitle(`📋 Logs: Run #${run.run_number}`)
-      .setDescription(`[Click here to view full logs on GitHub](${run.html_url})`)
-      .addFields(
-        { name: 'Status', value: run.status, inline: true },
-        { name: 'Conclusion', value: run.conclusion || 'Running', inline: true }
-      )
-      .setTimestamp();
-
-    await interaction.editReply({ embeds: [embed], components: [createButtons(run.id, run.html_url)] });
-  } catch (e) { handleGitHubError(e, interaction); }
-};
-
-const handleCancel = async (interaction) => {
-  await interaction.deferReply();
-  const serverName = interaction.guild.name;
-  const config = getServerConfig(serverName);
-  const octokit = getOctokit(serverName);
-  if (!octokit) return interaction.editReply('❌ Not Configured');
-
-  let runId = interaction.options.getString('run_id');
-  try {
-    if (!runId) {
-      const { data } = await octokit.actions.listWorkflowRuns({ owner: config.repo.owner, repo: config.repo.name, workflow_id: config.repo.workflowFile, status: 'in_progress' });
-      if (data.workflow_runs[0]) runId = data.workflow_runs[0].id;
-    }
-    
-    if (!runId) return interaction.editReply('❌ No active runs to cancel');
-
-    await octokit.actions.cancelWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: runId });
-    
-    const embed = new EmbedBuilder().setColor(COLORS.cancelled).setTitle('🚫 Workflow Cancelled').setDescription(`Run #${runId} has been cancelled.`).addFields({ name: 'By', value: interaction.user.tag });
-    await interaction.editReply({ embeds: [embed] });
-    sendLog(serverName, `🚫 Run #${runId} cancelled by ${interaction.user.tag}`);
-  } catch (e) { handleGitHubError(e, interaction); }
-};
-
-const handleCleanup = async (interaction) => {
-  await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  try {
-    const type = interaction.options.getString('type');
-    if (type === 'global' || type === 'all') await rest.put(Routes.applicationCommands(client.user.id), { body: [] });
-    if (type === 'guild' || type === 'all') await rest.put(Routes.applicationGuildCommands(client.user.id, interaction.guildId), { body: [] });
-    
-    await interaction.editReply('✅ Commands cleaned up. Restart bot to apply changes.');
-  } catch (e) { await interaction.editReply(`Error: ${e.message}`); }
+  await interaction.reply({ embeds: [embed], components: [row] });
 };
 
 const handleHelp = async (interaction) => {
@@ -550,218 +651,231 @@ const handleHelp = async (interaction) => {
     .setColor(COLORS.info)
     .setTitle('📚 Command Help')
     .addFields(
-      { name: '🚀 /build', value: 'Trigger a new build. Supports auto-complete for branches.' },
-      { name: '⚙️ /config', value: 'Open the Dashboard to configure GitHub token, repo, and settings.' },
-      { name: '📊 /workflow-status', value: 'View latest build status with live refresh.' },
-      { name: '📋 /build-logs', value: 'Get direct link to build logs.' },
-      { name: '📦 /list-artifacts', value: 'List downloadable files (APK, etc).' },
-      { name: '📈 /workflow-history', value: 'View success/failure rates.' },
-      { name: '🚫 /cancel-workflow', value: 'Stop a running build.' }
-    )
-    .setFooter({ text: 'Dartotsu Bot' });
+      { name: '/build', value: 'Trigger builds. Supports auto-complete for branches.' },
+      { name: '/workflow-status', value: 'Check current status (auto-refreshes).' },
+      { name: '/config', value: 'Open the Dashboard to configure the bot.' },
+      { name: '/build-logs', value: 'View logs of recent builds.' },
+      { name: '/list-artifacts', value: 'Download build artifacts.' },
+      { name: '/workflow-history', value: 'View success/fail stats.' }
+    );
   await interaction.reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
 };
 
-const checkPermissions = async (interaction) => {
-  const config = getServerConfig(interaction.guild.name);
-  if (interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-  if (!config.features.requirePermissions) return true;
-  if (config.discord.allowedRoleIds.length > 0 && interaction.member.roles.cache.some(r => config.discord.allowedRoleIds.includes(r.id))) return true;
-  await interaction.reply({ content: '❌ Permission Denied', flags: [MessageFlags.Ephemeral] });
-  return false;
+const handleCleanup = async (interaction) => {
+  await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: [] });
+    // Reregister
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    await interaction.editReply('✅ Commands cleaned up & re-registered.');
+  } catch (error) { await interaction.editReply(`Error: ${error.message}`); }
 };
 
-// --- 8. Event Loop & Interactions ---
+// ================================
+// EVENT HANDLERS
+// ================================
 const commands = [
-  { name: 'build', description: 'Trigger Build', options: [
-      { name: 'platform', description: 'Platform', type: 3, required: true, choices: [{name:'All',value:'all'},{name:'Android',value:'android'},{name:'Windows',value:'windows'},{name:'Linux',value:'linux'},{name:'iOS',value:'ios'},{name:'macOS',value:'macos'}] },
+  { name: 'build', description: 'Trigger build', options: [
+      { name: 'platform', description: 'Platform', type: 3, required: true, choices: [{ name: 'All', value: 'all' }, { name: 'Android', value: 'android' }, { name: 'Windows', value: 'windows' }, { name: 'Linux', value: 'linux' }, { name: 'iOS', value: 'ios' }, { name: 'macOS', value: 'macos' }] },
       { name: 'branch', description: 'Branch', type: 3, autocomplete: true },
-      { name: 'clean_build', description: 'Clean?', type: 5 },
+      { name: 'clean_build', description: 'Clean build?', type: 5 },
       { name: 'ping_discord', description: 'Ping?', type: 5 }
-    ]},
-  { name: 'config', description: 'Configure Bot', default_member_permissions: PermissionFlagsBits.Administrator.toString() },
-  { name: 'workflow-status', description: 'Check Status', options: [{ name: 'limit', description: 'Limit', type: 4 }, { name: 'auto_refresh', description: 'Auto Refresh', type: 5 }] },
+    ]
+  },
+  { name: 'workflow-status', description: 'Check status', options: [{ name: 'limit', description: 'Limit', type: 4 }, { name: 'auto_refresh', description: 'Auto refresh?', type: 5 }] },
+  { name: 'cancel-workflow', description: 'Cancel run', options: [{ name: 'run_id', description: 'Run ID', type: 3 }] },
   { name: 'build-logs', description: 'View logs', options: [{ name: 'run_id', description: 'Run ID', type: 3 }] },
   { name: 'list-artifacts', description: 'List artifacts', options: [{ name: 'run_id', description: 'Run ID', type: 3 }] },
   { name: 'workflow-history', description: 'View history', options: [{ name: 'days', description: 'Days', type: 4 }] },
-  { name: 'cancel-workflow', description: 'Cancel run', options: [{ name: 'run_id', description: 'Run ID', type: 3 }] },
-  { name: 'cleanup-commands', description: 'Reset commands', default_member_permissions: PermissionFlagsBits.Administrator.toString(), options: [{name: 'type', description: 'Type', type: 3, required: true, choices: [{name:'Global',value:'global'},{name:'Guild',value:'guild'},{name:'All',value:'all'}]}] },
-  { name: 'bot-info', description: 'Bot Info' },
-  { name: 'help', description: 'Help' }
+  { name: 'bot-info', description: 'Bot info' },
+  { name: 'help', description: 'Help' },
+  { name: 'config', description: 'Configure Bot', default_member_permissions: PermissionFlagsBits.Administrator.toString() },
+  { name: 'cleanup-commands', description: 'Cleanup', default_member_permissions: PermissionFlagsBits.Administrator.toString(), options: [{name:'type',description:'Type',type:3,required:true,choices:[{name:'Global',value:'global'},{name:'Guild',value:'guild'},{name:'All',value:'all'}]}] }
 ];
 
 client.once('ready', async () => {
+  const dbConnected = await testDatabaseConnection();
+  if (dbConnected) {
+    await initDatabase();
+    await loadConfigsFromDB();
+  }
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
   log(`✅ Bot Active as ${client.user.tag}`);
 });
 
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.guild) return interaction.reply('❌ DM not supported');
+  if (!interaction.guild) return interaction.reply({ content: '❌ DM not supported', flags: [MessageFlags.Ephemeral] });
+  
   const serverName = interaction.guild.name;
   const config = getServerConfig(serverName);
 
-  // Autocomplete
-  if (interaction.isAutocomplete() && interaction.commandName === 'build') {
-    const octokit = getOctokit(serverName);
-    if (!octokit || !config.repo.owner) return interaction.respond([]);
-    const now = Date.now();
-    const serverCache = cache.branches.get(serverName) || { data: [], time: 0 };
-    if (now - serverCache.time > 60000) { 
-      try {
-        const { data } = await octokit.repos.listBranches({ owner: config.repo.owner, repo: config.repo.name });
-        serverCache.data = data.map(b => b.name);
-        serverCache.time = now;
-        cache.branches.set(serverName, serverCache);
-      } catch (e) {}
-    }
-    const focus = interaction.options.getFocused();
-    const filtered = serverCache.data.filter(b => b.startsWith(focus)).slice(0, 25);
-    await interaction.respond(filtered.map(b => ({ name: b, value: b })));
-    return;
-  }
-
-  // Commands
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === 'config') return interaction.reply({ embeds: [getConfigEmbed(serverName)], components: getConfigComponents(), flags: [MessageFlags.Ephemeral] });
-    if (interaction.commandName === 'cleanup-commands') return handleCleanup(interaction);
-    
-    if (!await checkPermissions(interaction)) return;
-
-    const handlers = {
-      'build': handleBuild,
-      'workflow-status': handleStatus,
-      'build-logs': handleLogs,
-      'list-artifacts': handleArtifacts,
-      'workflow-history': handleHistory,
-      'cancel-workflow': handleCancel,
-      'bot-info': handleBotInfo,
-      'help': handleHelp
-    };
-
-    if (handlers[interaction.commandName]) await handlers[interaction.commandName](interaction);
-  }
-
-  // Dashboard UI
-  if (interaction.isStringSelectMenu() && interaction.customId === 'config_menu') {
-    const val = interaction.values[0];
-    if (val === 'cfg_github') {
-      const modal = new ModalBuilder().setCustomId('modal_gh').setTitle('GitHub Settings');
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tk').setLabel('Token').setStyle(1).setRequired(false).setPlaceholder('Leave empty to keep')),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ow').setLabel('Owner').setValue(config.repo.owner||'').setStyle(1)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('nm').setLabel('Repo Name').setValue(config.repo.name||'').setStyle(1)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('wf').setLabel('Workflow File').setValue(config.repo.workflowFile||'').setStyle(1)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('br').setLabel('Branch').setValue(config.repo.branch||'main').setStyle(1))
-      );
-      await interaction.showModal(modal);
-    } 
-    else if (val === 'cfg_discord') {
-      const modal = new ModalBuilder().setCustomId('modal_dc').setTitle('Discord Settings');
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('lg').setLabel('Log Channel ID').setValue(config.discord.logChannelId||'').setStyle(1).setRequired(false)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('rl').setLabel('Allowed Roles (IDs)').setValue(config.discord.allowedRoleIds.join(',')||'').setStyle(2).setRequired(false))
-      );
-      await interaction.showModal(modal);
-    }
-    else if (val === 'cfg_features') {
-       const row = new ActionRowBuilder().addComponents(
-         new ButtonBuilder().setCustomId('tg_perms').setLabel(`Perms: ${config.features.requirePermissions}`).setStyle(config.features.requirePermissions?3:4),
-         new ButtonBuilder().setCustomId('tg_logs').setLabel(`Logs: ${config.features.enableLogging}`).setStyle(config.features.enableLogging?3:4),
-         new ButtonBuilder().setCustomId('tg_auto').setLabel(`Refresh: ${config.features.autoRefreshStatus}`).setStyle(config.features.autoRefreshStatus?3:4),
-         new ButtonBuilder().setCustomId('tg_refresh').setLabel('Back').setStyle(2)
-       );
-       await interaction.update({ content: 'Toggles:', components: [row], embeds: [] });
-    }
-  }
-
-  if (interaction.isModalSubmit()) {
-    if (interaction.customId === 'modal_gh') {
-      const tk = interaction.fields.getTextInputValue('tk');
-      if (tk) await saveServerConfig(serverName, 'githubToken', encrypt(tk));
-      await saveServerConfig(serverName, 'repoOwner', interaction.fields.getTextInputValue('ow'));
-      await saveServerConfig(serverName, 'repoName', interaction.fields.getTextInputValue('nm'));
-      await saveServerConfig(serverName, 'workflowFile', interaction.fields.getTextInputValue('wf'));
-      await saveServerConfig(serverName, 'branch', interaction.fields.getTextInputValue('br'));
-      await interaction.update({ embeds: [getConfigEmbed(serverName)], components: getConfigComponents() });
-    }
-    if (interaction.customId === 'modal_dc') {
-      await saveServerConfig(serverName, 'logChannelId', interaction.fields.getTextInputValue('lg'));
-      const roles = interaction.fields.getTextInputValue('rl').split(',').map(r=>r.trim()).filter(r=>/^\d+$/.test(r));
-      await saveServerConfig(serverName, 'allowedRoles', JSON.stringify(roles));
-      await interaction.update({ embeds: [getConfigEmbed(serverName)], components: getConfigComponents() });
-    }
-  }
-
-  if (interaction.isButton()) {
-    if (interaction.customId === 'cfg_refresh' || interaction.customId === 'tg_refresh') await interaction.update({ content: '', embeds: [getConfigEmbed(serverName)], components: getConfigComponents() });
-    if (interaction.customId === 'cfg_test') {
+  try {
+    // 1. Autocomplete
+    if (interaction.isAutocomplete() && interaction.commandName === 'build') {
       const octokit = getOctokit(serverName);
-      if(!octokit) return interaction.reply({ content: '❌ No token', flags: [MessageFlags.Ephemeral] });
-      try {
-        const { data } = await octokit.users.getAuthenticated();
-        interaction.reply({ content: `✅ Connected as ${data.login}`, flags: [MessageFlags.Ephemeral] });
-      } catch(e) { interaction.reply({ content: '❌ Failed', flags: [MessageFlags.Ephemeral] }); }
+      if (!octokit || !config.repo.owner) return interaction.respond([]);
+      
+      const now = Date.now();
+      const serverCache = branchCache.get(serverName) || { data: [], time: 0 };
+      
+      if (now - serverCache.time > 60000) { // 1 min cache
+        try {
+          const { data } = await octokit.repos.listBranches({ owner: config.repo.owner, repo: config.repo.name, per_page: 30 });
+          serverCache.data = data.map(b => b.name);
+          serverCache.time = now;
+          branchCache.set(serverName, serverCache);
+        } catch (e) {}
+      }
+      
+      const focusedValue = interaction.options.getFocused();
+      const filtered = serverCache.data.filter(choice => choice.startsWith(focusedValue)).slice(0, 25);
+      await interaction.respond(filtered.map(choice => ({ name: choice, value: choice })));
+      return;
     }
-    if (interaction.customId.startsWith('tg_')) {
-      let key = '', val = false;
-      if (interaction.customId === 'tg_perms') { key='requirePermissions'; val=!config.features.requirePermissions; }
-      if (interaction.customId === 'tg_logs') { key='enableLogging'; val=!config.features.enableLogging; }
-      if (interaction.customId === 'tg_auto') { key='autoRefreshStatus'; val=!config.features.autoRefreshStatus; }
-      if(key) {
-        await saveServerConfig(serverName, key, val.toString());
-        const row = new ActionRowBuilder().addComponents(
-           new ButtonBuilder().setCustomId('tg_perms').setLabel(`Perms: ${config.features.requirePermissions}`).setStyle(config.features.requirePermissions?3:4),
-           new ButtonBuilder().setCustomId('tg_logs').setLabel(`Logs: ${config.features.enableLogging}`).setStyle(config.features.enableLogging?3:4),
-           new ButtonBuilder().setCustomId('tg_auto').setLabel(`Refresh: ${config.features.autoRefreshStatus}`).setStyle(config.features.autoRefreshStatus?3:4),
-           new ButtonBuilder().setCustomId('tg_refresh').setLabel('Back').setStyle(2)
+
+    // 2. Chat Commands
+    if (interaction.isChatInputCommand()) {
+      // Permissions check for non-config commands
+      if (interaction.commandName !== 'config' && interaction.commandName !== 'cleanup-commands' && !await checkPermissions(interaction)) return;
+
+      const handlers = {
+        'build': handleBuild,
+        'workflow-status': handleStatus,
+        'cancel-workflow': handleCancel,
+        'build-logs': handleLogs,
+        'list-artifacts': handleArtifacts,
+        'workflow-history': handleHistory,
+        'bot-info': handleBotInfo,
+        'help': handleHelp,
+        'cleanup-commands': handleCleanup,
+        'config': async (i) => i.reply({ embeds: [getConfigEmbed(serverName)], components: getConfigComponents(), flags: [MessageFlags.Ephemeral] })
+      };
+
+      const handler = handlers[interaction.commandName];
+      if (handler) await handler(interaction);
+    }
+
+    // 3. Dashboard Select Menu
+    if (interaction.isStringSelectMenu() && interaction.customId === 'config_menu') {
+      const val = interaction.values[0];
+      if (val === 'cfg_github') {
+        const modal = new ModalBuilder().setCustomId('modal_gh').setTitle('GitHub Settings');
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('tk').setLabel('Token').setStyle(1).setRequired(false).setPlaceholder('Leave empty to keep')),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ow').setLabel('Owner').setValue(config.repo.owner||'').setStyle(1)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('nm').setLabel('Repo Name').setValue(config.repo.name||'').setStyle(1)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('wf').setLabel('Workflow File').setValue(config.repo.workflowFile||'').setStyle(1)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('br').setLabel('Branch').setValue(config.repo.branch||'main').setStyle(1))
         );
-        await interaction.update({ components: [row] });
+        await interaction.showModal(modal);
+      } else if (val === 'cfg_discord') {
+        const modal = new ModalBuilder().setCustomId('modal_dc').setTitle('Discord Settings');
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('lg').setLabel('Log Channel ID').setValue(config.discord.logChannelId||'').setStyle(1).setRequired(false)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('rl').setLabel('Allowed Roles (IDs)').setValue(config.discord.allowedRoleIds.join(',')||'').setStyle(2).setRequired(false))
+        );
+        await interaction.showModal(modal);
+      } else if (val === 'cfg_features') {
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('tg_perms').setLabel(`Perms: ${config.features.requirePermissions}`).setStyle(config.features.requirePermissions?3:4),
+          new ButtonBuilder().setCustomId('tg_logs').setLabel(`Logs: ${config.features.enableLogging}`).setStyle(config.features.enableLogging?3:4),
+          new ButtonBuilder().setCustomId('tg_refresh').setLabel('Back').setStyle(2)
+        );
+        await interaction.update({ content: 'Feature Toggles:', components: [row], embeds: [] });
       }
     }
-    // Workflow Buttons
-    if (interaction.customId.startsWith('refresh_')) {
-      const runId = interaction.customId.split('_')[1];
-      try {
-        const { data } = await octokit.actions.getWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: runId });
-        const showCancel = data.status === 'in_progress' || data.status === 'queued';
-        // Re-create the specific embed from handleStatus
-        const icon = data.conclusion ? EMOJI.conclusion[data.conclusion] : EMOJI.status[data.status];
-        const embed = new EmbedBuilder()
-          .setColor(data.conclusion === 'success' ? COLORS.success : data.conclusion === 'failure' ? COLORS.failure : COLORS.in_progress)
-          .setTitle('📊 Workflow Status')
-          .setDescription(`**${data.display_title}**`)
-          .addFields(
-            { name: 'Status', value: `${icon} ${data.status.toUpperCase()}`, inline: true },
-            { name: 'Conclusion', value: data.conclusion || 'Running', inline: true }
-          )
-          .setURL(data.html_url)
-          .setTimestamp();
-        await interaction.update({ embeds: [embed], components: [createButtons(data.id, data.html_url, showCancel)] });
-      } catch(e) {}
+
+    // 4. Dashboard Modals
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === 'modal_gh') {
+        const tk = interaction.fields.getTextInputValue('tk');
+        if (tk) await saveServerConfig(serverName, 'githubToken', encrypt(tk));
+        await saveServerConfig(serverName, 'repoOwner', interaction.fields.getTextInputValue('ow'));
+        await saveServerConfig(serverName, 'repoName', interaction.fields.getTextInputValue('nm'));
+        await saveServerConfig(serverName, 'workflowFile', interaction.fields.getTextInputValue('wf'));
+        await saveServerConfig(serverName, 'branch', interaction.fields.getTextInputValue('br'));
+        await interaction.update({ embeds: [getConfigEmbed(serverName)], components: getConfigComponents() });
+      }
+      if (interaction.customId === 'modal_dc') {
+        await saveServerConfig(serverName, 'logChannelId', interaction.fields.getTextInputValue('lg'));
+        const roles = interaction.fields.getTextInputValue('rl').split(',').map(r=>r.trim()).filter(r=>/^\d+$/.test(r));
+        await saveServerConfig(serverName, 'allowedRoles', JSON.stringify(roles));
+        await interaction.update({ embeds: [getConfigEmbed(serverName)], components: getConfigComponents() });
+      }
     }
-    if (interaction.customId.startsWith('cancel_')) {
-       await handleCancel(interaction);
+
+    // 5. Buttons
+    if (interaction.isButton()) {
+      const id = interaction.customId;
+      
+      if (id === 'cfg_refresh' || id === 'tg_refresh') {
+        await interaction.update({ content: '', embeds: [getConfigEmbed(serverName)], components: getConfigComponents() });
+      }
+      else if (id === 'cfg_test') {
+        const octokit = getOctokit(serverName);
+        if(!octokit) return interaction.reply({ content: '❌ No token', flags: [MessageFlags.Ephemeral] });
+        try {
+          const { data } = await octokit.users.getAuthenticated();
+          interaction.reply({ content: `✅ Connected as ${data.login}`, flags: [MessageFlags.Ephemeral] });
+        } catch(e) { interaction.reply({ content: '❌ Connection Failed', flags: [MessageFlags.Ephemeral] }); }
+      }
+      else if (id.startsWith('tg_')) {
+        let key = '', val = false;
+        if (id === 'tg_perms') { key='requirePermissions'; val=!config.features.requirePermissions; }
+        if (id === 'tg_logs') { key='enableLogging'; val=!config.features.enableLogging; }
+        if(key) {
+          await saveServerConfig(serverName, key, val.toString());
+          const row = new ActionRowBuilder().addComponents(
+             new ButtonBuilder().setCustomId('tg_perms').setLabel(`Perms: ${config.features.requirePermissions}`).setStyle(config.features.requirePermissions?3:4),
+             new ButtonBuilder().setCustomId('tg_logs').setLabel(`Logs: ${config.features.enableLogging}`).setStyle(config.features.enableLogging?3:4),
+             new ButtonBuilder().setCustomId('tg_refresh').setLabel('Back').setStyle(2)
+          );
+          await interaction.update({ components: [row] });
+        }
+      }
+      else if (id.startsWith('refresh_')) {
+        const runId = id.split('_')[1];
+        try {
+          const run = await getLatestRun(serverName, runId);
+          const showCancel = run.status === 'in_progress' || run.status === 'queued';
+          await interaction.update({ embeds: [createRunEmbed(run)], components: [createButtons(run.id, run.html_url, showCancel)] });
+        } catch(e) {}
+      }
+      else if (id.startsWith('cancel_')) {
+        // Manually call handleCancel logic here or extract it
+        await interaction.deferUpdate();
+        const runId = id.split('_')[1];
+        const octokit = getOctokit(serverName);
+        try {
+          await octokit.actions.cancelWorkflowRun({ owner: config.repo.owner, repo: config.repo.name, run_id: runId });
+          await interaction.followUp({ content: '✅ Cancelled', flags: [MessageFlags.Ephemeral] });
+        } catch(e) { await interaction.followUp({ content: '❌ Failed', flags: [MessageFlags.Ephemeral] }); }
+      }
     }
+
+  } catch (error) {
+    log(`Interaction Error: ${error.message}`, 'ERROR');
+    // Do not reply here to avoid "Already Replied" errors, just log
   }
 });
 
-client.on('error', error => log(`Client error: ${error.message}`, 'ERROR'));
-process.on('unhandledRejection', error => log(`Unhandled rejection: ${error.message}`, 'ERROR'));
-
 // --- 9. Startup ---
 const startBot = async () => {
-  const dbConnected = await pool.connect().catch(() => null);
+  const dbConnected = await testDatabaseConnection();
   if (!dbConnected) {
     console.error('❌ Failed to connect to PostgreSQL database');
     process.exit(1);
   }
-  dbConnected.release();
   
   await initDatabase();
   await loadConfigsFromDB();
   
-  if (!process.env.DISCORD_TOKEN) { console.error('❌ Discord Token missing'); process.exit(1); }
+  if (!process.env.DISCORD_TOKEN) { 
+    console.error('❌ Discord Token not configured.');
+    process.exit(1); 
+  }
   
   client.login(process.env.DISCORD_TOKEN).catch(error => { 
     log(`Login failed: ${error.message}`, 'ERROR'); 
