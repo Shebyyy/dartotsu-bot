@@ -1,7 +1,7 @@
 {
   "name": "dartotsu-discord-bot",
   "version": "2.2.0",
-  "description": "Enhanced Discord bot for triggering Dartotsu builds via GitHub Actions",
+  "description": "Discord bot for triggering Dartotsu builds via GitHub Actions",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
